@@ -1,0 +1,8 @@
+__pycache__
+.pytest_cache
+*.pyc
+.superpowers
+venv
+.worktrees/
+/config.yaml
+/docs/

@@ -1,0 +1,84 @@
+eviction_timeout: 60         # max seconds to wait for in-flight requests before eviction command
+eviction_command_timeout: 60  # subprocess timeout for eviction command (seconds)
+wait_queue_timeout: 60      # per-entry timeout in VRAMWaitQueue (seconds)
+connection_timeout: 30     # TCP connection timeout for target/backup endpoints (seconds)
+sock_read_timeout: 120    # socket read timeout for upstream responses (seconds)
+total_vram_budget: 20480  # MiB (may be less than actual 24576 MiB)
+poll_interval: 5           # seconds between GPU polls
+listen_port: 8080         # proxy listen port
+dashboard_hostname: gpu-proxy.local
+
+plugins:
+  - name: "auth"
+    type: "AuthPlugin"
+    config:
+      api_key: "your-api-key-here"
+
+  - name: "rate_limiter"
+    type: "RateLimitPlugin"
+    config:
+      max_requests: 100
+      window_seconds: 60
+
+  - name: "openai_chat_modifier"
+    type: "OpenAIChatRequestModifier"
+    config:
+      overrides:
+        model: "gpt-4"
+        temperature: 0.7
+        response_format:
+          type: "json_schema"
+
+  - name: "openai_guard_rail"
+    type: "OpenAIGuardRail"
+    config:
+      break_loops: true
+      dedup_tool_calls: true
+      validate_tool_calls: true
+      tool_call_dedup_exclusions:
+        - tool_name_regex: '(?i)read'
+          tool_args_regex: '(?i)skills?\.md'
+
+services:
+  llamacpp-server:
+    priority: 1
+    vram_budget: 16384     # MiB
+    hostname: llamacpp.local  # demultiplex incoming requests by Host header
+    target: http://127.0.0.1:49863
+    container: llamacpp-server
+    gpu_routes:
+      - "/v1/completions"
+      - "/v1/chat/completions"
+      - "/v1/responses"
+    eviction_command: "docker restart {container}"  # optional; default is docker restart {container}
+    backup: http://127.0.0.1:49864
+    plugins:
+      - "auth"
+      - "rate_limiter"
+      - "openai_chat_modifier"
+
+  cpai:
+    priority: 2
+    vram_budget: 4096
+    hostname: cpai.local
+    target: http://127.0.0.1:32168
+    container: cpai
+    # is_persistent: true  # protects this service from eviction by lower-priority services
+    # fallback_on_error: false  # when false, target errors are NOT retried on backup (default: true)
+    gpu_routes:
+      - "/api/detect"
+    # eviction_command: "systemctl restart {container}"  # example custom eviction command
+    backup: http://127.0.0.1:32169
+    health_check_command: "curl -sf http://127.0.0.1:32168/health" # optional shell command
+    health_check_interval: 5 # optional seconds; default is 5
+
+  external-llm:
+    external: true         # bypasses VRAM budget and GPU polling
+    # priority: 1          # BANNED for external services
+    # vram_budget: 4096    # BANNED for external services
+    # container: some-cont # BANNED for external services
+    hostname: external.local
+    target: http://192.168.1.50:8080
+    health_check_command: "curl -sf http://192.168.1.50:8080/health"
+    health_check_interval: 10
+    backup: http://127.0.0.1:8081

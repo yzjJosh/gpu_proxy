@@ -1,0 +1,14 @@
+[Unit]
+Description=GPU Priority Reverse Proxy
+After=docker.service network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/var/gpu_proxy
+ExecStart=/var/gpu_proxy/venv/bin/python3 -m app.main
+Restart=always
+StandardOutput=append:/var/log/gpu-proxy.log
+StandardError=append:/var/log/gpu-proxy.log
+
+[Install]
+WantedBy=multi-user.target
