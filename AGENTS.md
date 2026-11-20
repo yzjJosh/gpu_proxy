@@ -13,7 +13,8 @@ A Python `aiohttp` reverse proxy that multiplexes multiple GPU-backed services s
 - `budget.py` — VRAM budget math: `compute_effective_remaining`, `get_eviction_candidates`
 - `wait_queue.py` — priority-ordered VRAM admission queue (admit / wait / backup decision)
 - `service_state.py` — per-service state machine (`cold → warm → hot → cooling_down → evicting → restarting → unhealthy`) with validated transitions and in-flight tracking
-- `gpu_monitor.py` — background polling of GPU + per-container VRAM via the `nvidia_docker_usage` library
+- `gpu_monitor.py` — background polling of GPU + per-container VRAM into a `GPUStatus` snapshot
+- `gpu_usage.py` — reads the GPU through NVML and gives each Docker container exactly the VRAM NVML reports for its processes (containers found via `/proc/<pid>/cgroup`); VRAM no process owns is never attributed to a container
 - `eviction.py` — bounded eviction/routing event log (quiet + full buffers)
 - `watchdog.py` — background thread that detects asyncio event-loop stalls
 - `main.py` — entry point (`python3 -m app.main`)
@@ -33,13 +34,13 @@ The four OpenAI plugins read and write the wire format through per-API dialects,
 
 **Configuration:** `config.yaml` at the repo root (template: `config.example.yaml`). Each service declares a `priority`, `vram_budget`, `hostname` (the demux key), `target` URL, optional `backup` URL, `gpu_routes`, and optional `health_check_command` / `is_persistent`. `total_vram_budget` and `listen_port` are set at the top level.
 
-**External dependency:** `app/gpu_monitor.py` imports the `nvidia_docker_usage` library from `/usr/local/bin` (injected via `sys.path` at import time). It must be present on the host.
+**Host requirements:** `app/gpu_usage.py` needs the NVIDIA driver (NVML, memory info v2), the Docker socket, and read access to `/proc/<pid>/cgroup` for GPU processes, so the proxy runs as root on the GPU host.
 
 **Environment variables:** none — all runtime configuration lives in `config.yaml`.
 
 ## Running Tests
 
-Tests use pytest with asyncio auto mode (`asyncio_mode = "auto"` in `pyproject.toml`). Test files mirror the `app/` layout under `tests/app/`. A `conftest.py` provides shared fixtures, SSE builders, a virtual `FakeClock`, test-only fake plugins, and an **autouse fixture that mocks `asyncio.create_subprocess_exec`** so no test touches real `docker restart` / NVML / GPU hardware.
+Tests use pytest with asyncio auto mode (`asyncio_mode = "auto"` in `pyproject.toml`). Test files mirror the `app/` layout under `tests/app/`. A `conftest.py` provides shared fixtures, SSE builders, a virtual `FakeClock`, test-only fake plugins, an **autouse fixture that mocks `asyncio.create_subprocess_exec`** so no test runs a real `docker restart`, and `FakeNvidiaHost`, which stands in for NVML, the Docker API and `/proc` (via `with host.installed():`) so no test touches GPU hardware.
 
 **From `/var/gpu_proxy`** (use the project venv):
 ```bash

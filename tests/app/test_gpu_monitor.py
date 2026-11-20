@@ -1,20 +1,15 @@
-"""Tests for GPU monitor: library-based polling, conversion, and lifecycle."""
+"""Tests for polling, converting, starting and stopping the GPU monitor."""
 
 import asyncio
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Callable, Optional
-from unittest.mock import patch
 
-from app.gpu_monitor import (
-    ClockProtocol,
-    GPUStatus,
-    GpuMonitor,
-    LibContainerUsage,
-    LibGpuStats,
-)
+import aiodocker
+import pynvml
 
-# Importing app.gpu_monitor is what puts the library on sys.path, so this follows it.
-from nvidia_docker_usage import ContainerProcess, NvmlError
+from app.gpu_monitor import ClockProtocol, GPUStatus, GpuMonitor
+from app.gpu_usage import GpuProcess
+from tests.app.conftest import FakeGpuProcess, FakeNvidiaHost
 
 _POLL_TIME = 1000.0
 _ALTERNATE_POLL_TIME = 42.0
@@ -28,8 +23,6 @@ _TOTAL_VRAM_MIB = 24576
 _IDLE_USED_VRAM_MIB = 860
 _IDLE_FREE_VRAM_MIB = 23716
 _LOADED_USED_VRAM_MIB = 1606
-_LOADED_FREE_VRAM_MIB = 22970
-_SOLE_CONTAINER_FREE_VRAM_MIB = 23830
 _OVERSUBSCRIBED_USED_VRAM_MIB = 500
 
 _LLAMACPP = "llamacpp-server"
@@ -43,13 +36,16 @@ _POWER_LIMIT_W = 250.0
 _IDLE_TEMP_C = 40
 _IDLE_GR_CLOCK_MHZ = 210
 _IDLE_MEM_CLOCK_MHZ = 405
-_IDLE_PSTATE = "P8"
+_IDLE_PSTATE = 8
 
 _BUSY_UTIL_PCT = 10
 _BUSY_GR_CLOCK_MHZ = 1980
 _BUSY_MEM_CLOCK_MHZ = 3122
-_BUSY_PSTATE = "P2"
+_BUSY_PSTATE = 2
+_BUSY_PSTATE_NAME = "P2"
 
+_LLAMACPP_PID = 1200
+_CPAI_PID = 1300
 _PROCESS_PID = 1234
 _PROCESS_COMMAND = "/app/llama-server"
 _PROCESS_VRAM_MIB = 746
@@ -98,95 +94,41 @@ class PollClock(ClockProtocol):
         self._resume.set()
 
 
-class FakeGpuLibrary:
-    """Scriptable stand-in for the NVIDIA library the monitor polls.
-
-    Reports the readings a test configured, counts what the monitor asked of
-    it, and can be told to fail at any of the three points the real library
-    can fail: opening the connection, querying stats, querying containers.
-    """
-
-    def __init__(
-        self,
-        stats: Optional[LibGpuStats] = None,
-        containers: Optional[list[LibContainerUsage]] = None,
-        init_error: Optional[Exception] = None,
-        stats_error: Optional[Exception] = None,
-        containers_error: Optional[Exception] = None,
-    ) -> None:
-        self.stats = _lib_stats() if stats is None else stats
-        self.containers = [] if containers is None else containers
-        self.init_error = init_error
-        self.stats_error = stats_error
-        self.containers_error = containers_error
-        self.inits = 0
-        self.polls = 0
-        self.closes = 0
-
-    async def init(self) -> None:
-        """Open the GPU connection, failing if the test asked it to."""
-        self.inits += 1
-        if self.init_error is not None:
-            raise self.init_error
-
-    async def close(self) -> None:
-        """Shut the GPU connection down."""
-        self.closes += 1
-
-    async def get_stats(self) -> LibGpuStats:
-        """Return the GPU-wide reading the test configured."""
-        self.polls += 1
-        if self.stats_error is not None:
-            raise self.stats_error
-        return self.stats
-
-    async def get_container_usage(self) -> list[LibContainerUsage]:
-        """Return the per-container readings the test configured."""
-        if self.containers_error is not None:
-            raise self.containers_error
-        return self.containers
-
-
-def _lib_stats(
-    total_vram_mib: int = _TOTAL_VRAM_MIB,
+def _host(
     used_vram_mib: int = _IDLE_USED_VRAM_MIB,
-    available_vram_mib: int = _IDLE_FREE_VRAM_MIB,
-    gpu_utilization_pct: int = 0,
-    power_draw_w: float = _IDLE_POWER_W,
-    power_limit_w: float = _POWER_LIMIT_W,
+    processes: Optional[list[FakeGpuProcess]] = None,
+    gpu_util_pct: int = 0,
     gr_clock_mhz: int = _IDLE_GR_CLOCK_MHZ,
     mem_clock_mhz: int = _IDLE_MEM_CLOCK_MHZ,
-    pstate: str = _IDLE_PSTATE,
-    temperature_c: int = _IDLE_TEMP_C,
-) -> LibGpuStats:
-    """A GPU-wide reading as the library reports it, idle unless overridden."""
-    return LibGpuStats(
-        total_vram_mib=total_vram_mib,
+    pstate: int = _IDLE_PSTATE,
+) -> FakeNvidiaHost:
+    """A GPU host with the given processes, idle unless overridden."""
+    host = FakeNvidiaHost(
+        total_vram_mib=_TOTAL_VRAM_MIB,
         used_vram_mib=used_vram_mib,
-        available_vram_mib=available_vram_mib,
-        gpu_utilization_pct=gpu_utilization_pct,
-        power_draw_w=power_draw_w,
-        power_limit_w=power_limit_w,
-        gr_clock_mhz=gr_clock_mhz,
-        mem_clock_mhz=mem_clock_mhz,
-        pstate=pstate,
-        temperature_c=temperature_c,
-        reserved_vram_mib=0,
+        processes=processes,
     )
+    host.gpu_util_pct = gpu_util_pct
+    host.power_draw_w = _IDLE_POWER_W
+    host.power_limit_w = _POWER_LIMIT_W
+    host.temperature_c = _IDLE_TEMP_C
+    host.gr_clock_mhz = gr_clock_mhz
+    host.mem_clock_mhz = mem_clock_mhz
+    host.pstate = pstate
+    return host
 
 
-def _lib_container(
-    name: str = _LLAMACPP,
-    total_vram_mib: int = _LLAMACPP_VRAM_MIB,
-    total_gpu_utilization_pct: int = _LLAMACPP_UTIL_PCT,
-    processes: Optional[list[ContainerProcess]] = None,
-) -> LibContainerUsage:
-    """One container's usage as the library reports it."""
-    return LibContainerUsage(
-        name=name,
-        processes=[] if processes is None else processes,
-        total_vram_mib=total_vram_mib,
-        total_gpu_utilization_pct=total_gpu_utilization_pct,
+def _host_without_driver() -> FakeNvidiaHost:
+    """A GPU host whose driver will not start."""
+    host = _host()
+    host.init_error = pynvml.NVMLError(pynvml.NVML_ERROR_DRIVER_NOT_LOADED)
+    return host
+
+
+def _llamacpp_process() -> FakeGpuProcess:
+    """The llamacpp server process."""
+    return FakeGpuProcess.from_mib(
+        _LLAMACPP_PID, _LLAMACPP_VRAM_MIB, _LLAMACPP, sm_utilization_pct=_LLAMACPP_UTIL_PCT
     )
 
 
@@ -217,12 +159,12 @@ async def _stop(monitor: GpuMonitor) -> None:
 
 @asynccontextmanager
 async def _started(
-    library: FakeGpuLibrary,
+    host: FakeNvidiaHost,
     clock: Optional[ClockProtocol] = None,
     poll_interval: int = _DEFAULT_POLL_INTERVAL_S,
     on_update: Optional[Callable[[GPUStatus], None]] = None,
 ) -> AsyncIterator[GpuMonitor]:
-    """Run a monitor against the given fake library for the body of the block.
+    """Run a monitor against the given fake GPU host for the body of the block.
 
     The monitor is started on the way in and always stopped on the way out,
     which is the lifecycle the proxy gives it in production.
@@ -232,7 +174,7 @@ async def _started(
         poll_interval=poll_interval,
         on_update=on_update,
     )
-    with patch("app.gpu_monitor.LibGpuUsageMonitor", lambda: library):
+    with host.installed():
         await monitor.start()
         try:
             yield monitor
@@ -241,22 +183,20 @@ async def _started(
 
 
 async def _poll(
-    stats: Optional[LibGpuStats] = None,
-    containers: Optional[list[LibContainerUsage]] = None,
+    host: Optional[FakeNvidiaHost] = None,
     clock: Optional[ClockProtocol] = None,
 ) -> GPUStatus:
-    """The status a running monitor reports for one poll of the given readings."""
-    library = FakeGpuLibrary(stats=stats, containers=containers)
-    async with _started(library, clock=clock) as monitor:
+    """The status a running monitor reports for one poll of the given host."""
+    async with _started(_host() if host is None else host, clock=clock) as monitor:
         return await monitor.poll_once()
 
 
 class TestConvertStats:
-    """Tests for the GPUStatus a poll builds out of the library's readings."""
+    """Tests for the GPUStatus a poll builds out of the GPU host's readings."""
 
     async def test_convert_basic_stats(self) -> None:
         """An idle GPU with no containers reports every headline figure."""
-        status = await _poll(_lib_stats())
+        status = await _poll(_host())
         assert status.total_vram_mib == _TOTAL_VRAM_MIB
         assert status.available_vram_mib == _IDLE_FREE_VRAM_MIB
         assert status.system_vram_mib == _IDLE_USED_VRAM_MIB
@@ -271,18 +211,13 @@ class TestConvertStats:
     async def test_convert_with_containers(self) -> None:
         """Container VRAM is attributed to Docker and taken off the system's share."""
         status = await _poll(
-            _lib_stats(
+            _host(
                 used_vram_mib=_LOADED_USED_VRAM_MIB,
-                available_vram_mib=_LOADED_FREE_VRAM_MIB,
-            ),
-            [
-                _lib_container(),
-                _lib_container(
-                    name=_CPAI,
-                    total_vram_mib=_CPAI_VRAM_MIB,
-                    total_gpu_utilization_pct=0,
-                ),
-            ],
+                processes=[
+                    _llamacpp_process(),
+                    FakeGpuProcess.from_mib(_CPAI_PID, _CPAI_VRAM_MIB, _CPAI),
+                ],
+            )
         )
         docker_vram_mib = _LLAMACPP_VRAM_MIB + _CPAI_VRAM_MIB
         assert status.docker_vram_mib == docker_vram_mib
@@ -295,7 +230,7 @@ class TestConvertStats:
 
     async def test_convert_no_containers(self) -> None:
         """With nothing running in Docker, all used VRAM belongs to the system."""
-        status = await _poll(_lib_stats(used_vram_mib=_IDLE_USED_VRAM_MIB))
+        status = await _poll(_host(used_vram_mib=_IDLE_USED_VRAM_MIB))
         assert status.docker_vram_mib == 0
         assert status.system_vram_mib == _IDLE_USED_VRAM_MIB
         assert status.containers == {}
@@ -306,31 +241,39 @@ class TestConvertStats:
         assert status.last_updated == _ALTERNATE_POLL_TIME
 
     async def test_convert_processes_preserved(self) -> None:
-        """The processes the library attributes to a container survive conversion."""
-        process = ContainerProcess(
-            pid=_PROCESS_PID,
-            command=_PROCESS_COMMAND,
-            vram_mib=_PROCESS_VRAM_MIB,
-            sm_utilization_pct=_PROCESS_UTIL_PCT,
-        )
+        """The processes attributed to a container survive conversion."""
         status = await _poll(
-            _lib_stats(
+            _host(
                 used_vram_mib=_LLAMACPP_VRAM_MIB,
-                available_vram_mib=_SOLE_CONTAINER_FREE_VRAM_MIB,
-            ),
-            [_lib_container(processes=[process])],
+                processes=[
+                    FakeGpuProcess.from_mib(
+                        _PROCESS_PID,
+                        _PROCESS_VRAM_MIB,
+                        _LLAMACPP,
+                        command=_PROCESS_COMMAND,
+                        sm_utilization_pct=_PROCESS_UTIL_PCT,
+                    )
+                ],
+            )
         )
-        assert status.containers[_LLAMACPP].processes == [process]
+        assert status.containers[_LLAMACPP].processes == [
+            GpuProcess(
+                pid=_PROCESS_PID,
+                command=_PROCESS_COMMAND,
+                vram_mib=_PROCESS_VRAM_MIB,
+                sm_utilization_pct=_PROCESS_UTIL_PCT,
+            )
+        ]
 
     async def test_convert_gpu_utilization(self) -> None:
         """GPU utilization is carried across under the name GPUStatus gives it."""
-        status = await _poll(_lib_stats(gpu_utilization_pct=_BUSY_UTIL_PCT))
+        status = await _poll(_host(gpu_util_pct=_BUSY_UTIL_PCT))
         assert status.gpu_util_pct == _BUSY_UTIL_PCT
 
     async def test_convert_clocks_and_pstate(self) -> None:
         """Graphics clock, memory clock, and P-State come across untouched."""
         status = await _poll(
-            _lib_stats(
+            _host(
                 gr_clock_mhz=_BUSY_GR_CLOCK_MHZ,
                 mem_clock_mhz=_BUSY_MEM_CLOCK_MHZ,
                 pstate=_BUSY_PSTATE,
@@ -338,13 +281,15 @@ class TestConvertStats:
         )
         assert status.gr_clock_mhz == _BUSY_GR_CLOCK_MHZ
         assert status.mem_clock_mhz == _BUSY_MEM_CLOCK_MHZ
-        assert status.pstate == _BUSY_PSTATE
+        assert status.pstate == _BUSY_PSTATE_NAME
 
     async def test_convert_negative_system_vram_docker_exceeds_used(self) -> None:
         """System VRAM is allowed to go negative when containers exceed reported use."""
         status = await _poll(
-            _lib_stats(used_vram_mib=_OVERSUBSCRIBED_USED_VRAM_MIB),
-            [_lib_container()],
+            _host(
+                used_vram_mib=_OVERSUBSCRIBED_USED_VRAM_MIB,
+                processes=[_llamacpp_process()],
+            )
         )
         assert status.system_vram_mib == _OVERSUBSCRIBED_USED_VRAM_MIB - _LLAMACPP_VRAM_MIB
         assert status.system_vram_mib < 0
@@ -357,25 +302,25 @@ class TestGpuMonitorInit:
     async def test_default_params(self) -> None:
         """A monitor built without a poll interval waits five seconds between polls."""
         clock = PollClock()
-        async with _started(FakeGpuLibrary(), clock=clock):
+        async with _started(_host(), clock=clock):
             assert await clock.next_sleep() == _DEFAULT_POLL_INTERVAL_S
 
     async def test_custom_params(self) -> None:
         """A monitor built with a poll interval waits exactly that long between polls."""
         clock = PollClock()
         async with _started(
-            FakeGpuLibrary(), clock=clock, poll_interval=_CUSTOM_POLL_INTERVAL_S
+            _host(), clock=clock, poll_interval=_CUSTOM_POLL_INTERVAL_S
         ):
             assert await clock.next_sleep() == _CUSTOM_POLL_INTERVAL_S
 
     async def test_monitor_initially_none(self) -> None:
-        """Building a monitor touches no GPU: only start() opens the library."""
-        library = FakeGpuLibrary()
-        with patch("app.gpu_monitor.LibGpuUsageMonitor", lambda: library):
+        """Building a monitor does not touch the GPU. Only start opens the driver."""
+        host = _host()
+        with host.installed():
             monitor = GpuMonitor(clock=PollClock())
             status = await monitor.poll_once()
-        assert library.inits == 0
-        assert library.polls == 0
+        assert host.inits == 0
+        assert host.polls == 0
         assert status.poll_failed is True
 
 
@@ -383,34 +328,36 @@ class TestGpuMonitorPoll:
     """Tests for GPU polling behavior."""
 
     async def test_poll_once_with_monitor_returns_status(self) -> None:
-        """A poll against a working library reports the reading it got back."""
-        status = await _poll(_lib_stats(used_vram_mib=_IDLE_USED_VRAM_MIB))
+        """A poll against a working GPU reports the reading it got back."""
+        status = await _poll(_host(used_vram_mib=_IDLE_USED_VRAM_MIB))
         assert status.poll_failed is False
         assert status.total_vram_mib == _TOTAL_VRAM_MIB
         assert status.system_vram_mib == _IDLE_USED_VRAM_MIB
         assert status.last_updated == _POLL_TIME
 
     async def test_poll_once_without_monitor_returns_failed(self) -> None:
-        """With no library connection, a poll reports failure and no reading at all."""
-        library = FakeGpuLibrary(init_error=RuntimeError("NVML not available"))
-        async with _started(library) as monitor:
+        """With no driver connection, a poll reports failure and no reading at all."""
+        host = _host_without_driver()
+        async with _started(host) as monitor:
             status = await monitor.poll_once()
         assert status.poll_failed is True
         assert status.last_updated is None
         assert status.total_vram_mib == 0
 
     async def test_poll_once_exception_returns_failed(self) -> None:
-        """A stats query that raises is reported as a failed poll, not propagated."""
-        library = FakeGpuLibrary(stats_error=RuntimeError("NVML error"))
-        async with _started(library) as monitor:
+        """A driver query that raises is reported as a failed poll, not propagated."""
+        host = _host()
+        host.poll_fails = True
+        async with _started(host) as monitor:
             status = await monitor.poll_once()
         assert status.poll_failed is True
         assert status.last_updated is None
 
     async def test_poll_once_container_exception_returns_failed(self) -> None:
-        """A container query that raises discards the stats reading that did succeed."""
-        library = FakeGpuLibrary(containers_error=RuntimeError("Docker error"))
-        async with _started(library) as monitor:
+        """A Docker query that raises discards the GPU reading that did succeed."""
+        host = _host()
+        host.docker_error = aiodocker.DockerError(500, "Docker error")
+        async with _started(host) as monitor:
             status = await monitor.poll_once()
         assert status.poll_failed is True
         assert status.total_vram_mib == 0
@@ -419,7 +366,7 @@ class TestGpuMonitorPoll:
     async def test_on_update_callback_invoked_after_poll(self) -> None:
         """The callback receives the very status a successful poll returns."""
         seen: list[GPUStatus] = []
-        async with _started(FakeGpuLibrary(), on_update=seen.append) as monitor:
+        async with _started(_host(), on_update=seen.append) as monitor:
             status = await monitor.poll_once()
             assert seen[-1] is status
             assert seen[-1].poll_failed is False
@@ -428,8 +375,9 @@ class TestGpuMonitorPoll:
     async def test_on_update_callback_invoked_on_failure(self) -> None:
         """The callback hears about a failed poll too, and hears that it failed."""
         seen: list[GPUStatus] = []
-        library = FakeGpuLibrary(stats_error=RuntimeError("fail"))
-        async with _started(library, on_update=seen.append) as monitor:
+        host = _host()
+        host.poll_fails = True
+        async with _started(host, on_update=seen.append) as monitor:
             status = await monitor.poll_once()
             assert seen[-1] is status
             assert seen[-1].poll_failed is True
@@ -442,11 +390,11 @@ class TestGpuMonitorPoll:
         for a service is entirely the caller's business.
         """
         seen: list[GPUStatus] = []
-        library = FakeGpuLibrary()
-        async with _started(library, on_update=seen.append) as monitor:
+        host = _host()
+        async with _started(host, on_update=seen.append) as monitor:
             first = await monitor.poll_once()
             assert seen[-1] is first
-            library.stats = _lib_stats(gpu_utilization_pct=_BUSY_UTIL_PCT)
+            host.gpu_util_pct = _BUSY_UTIL_PCT
             later = await monitor.poll_once()
             assert seen[-1] is later
         assert first.gpu_util_pct == 0
@@ -454,8 +402,7 @@ class TestGpuMonitorPoll:
 
     async def test_first_poll_failed_no_cache_routes_all_to_backup(self) -> None:
         """A failed first poll reports no capacity, so nothing reads spare VRAM into it."""
-        library = FakeGpuLibrary(init_error=RuntimeError("no GPU"))
-        async with _started(library) as monitor:
+        async with _started(_host_without_driver()) as monitor:
             status = await monitor.poll_once()
         assert status.poll_failed is True
         assert status.last_updated is None
@@ -467,43 +414,45 @@ class TestGpuMonitorStartStop:
     """Tests for starting and stopping the monitor."""
 
     async def test_start_initializes_monitor(self) -> None:
-        """start() opens the library connection once and polls through it."""
-        library = FakeGpuLibrary()
+        """Start opens the driver once and polls through it."""
+        host = _host()
         clock = PollClock()
-        async with _started(library, clock=clock) as monitor:
+        async with _started(host, clock=clock) as monitor:
             assert await clock.next_sleep() == _DEFAULT_POLL_INTERVAL_S
-            assert library.inits == 1
-            assert library.polls == 1
+            assert host.inits == 1
+            assert host.polls == 1
             status = await monitor.poll_once()
         assert status.poll_failed is False
 
     async def test_start_failure_sets_monitor_none(self) -> None:
-        """A library that fails to open is dropped, unpolled and never closed."""
-        library = FakeGpuLibrary(init_error=RuntimeError("NVML not available"))
-        async with _started(library) as monitor:
+        """A driver that fails to start is dropped, unpolled and never shut down."""
+        host = _host_without_driver()
+        async with _started(host) as monitor:
             status = await monitor.poll_once()
         assert status.poll_failed is True
-        assert library.polls == 0
-        assert library.closes == 0
+        assert host.polls == 0
+        assert host.closes == 0
 
     async def test_start_nvml_error_sets_monitor_none(self) -> None:
-        """An NvmlError while opening the library never reaches the caller of start()."""
-        library = FakeGpuLibrary(init_error=NvmlError("NVML init failed"))
-        async with _started(library) as monitor:
+        """A missing GPU at start does not reach the caller."""
+        host = _host()
+        host.handle_error = pynvml.NVMLError(pynvml.NVML_ERROR_INVALID_ARGUMENT)
+        async with _started(host) as monitor:
             status = await monitor.poll_once()
         assert status.poll_failed is True
-        assert library.polls == 0
+        assert host.polls == 0
+        assert host.closes == 1
 
     async def test_stop_closes_monitor(self) -> None:
-        """stop() closes the library, and polls afterwards report failure."""
-        library = FakeGpuLibrary()
+        """Stop closes the driver, and later polls fail."""
+        host = _host()
         monitor = GpuMonitor(clock=PollClock())
-        with patch("app.gpu_monitor.LibGpuUsageMonitor", lambda: library):
+        with host.installed():
             await monitor.start()
             running = await monitor.poll_once()
             await _stop(monitor)
         assert running.poll_failed is False
-        assert library.closes == 1
+        assert host.closes == 1
         stopped = await monitor.poll_once()
         assert stopped.poll_failed is True
 
@@ -515,27 +464,27 @@ class TestGpuMonitorStartStop:
         one: a poll that outlives stop() still reports to the update callback.
         """
         seen: list[GPUStatus] = []
-        library = FakeGpuLibrary()
+        host = _host()
         clock = PollClock()
-        async with _started(library, clock=clock, on_update=seen.append) as monitor:
+        async with _started(host, clock=clock, on_update=seen.append) as monitor:
             await clock.next_sleep()
-            assert library.polls == 1
+            assert host.polls == 1
             clock.release()
             await clock.next_sleep()
-            assert library.polls == 2
+            assert host.polls == 2
             await monitor.start()
             await clock.next_sleep()
-            assert library.polls == 3
+            assert host.polls == 3
         clock.release()
         await asyncio.sleep(0)
-        assert library.polls == 3
+        assert host.polls == 3
         assert len(seen) == 3
 
     async def test_stop_is_idempotent(self) -> None:
-        """Stopping an already-stopped monitor closes the library no more than once."""
-        library = FakeGpuLibrary()
-        async with _started(library) as monitor:
+        """Stopping an already-stopped monitor closes the driver no more than once."""
+        host = _host()
+        async with _started(host) as monitor:
             await _stop(monitor)
             await _stop(monitor)
-            assert library.closes == 1
-        assert library.closes == 1
+            assert host.closes == 1
+        assert host.closes == 1
