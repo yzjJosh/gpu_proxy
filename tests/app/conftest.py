@@ -2,7 +2,14 @@
 
 import abc
 import asyncio
+import hashlib
 import json
+import re
+import threading
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+from types import SimpleNamespace
 from typing import (
     AsyncIterator,
     Awaitable,
@@ -11,11 +18,14 @@ from typing import (
     Iterator,
     NamedTuple,
     Optional,
+    Self,
     override,
 )
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pynvml
 import pytest
+from aiodocker.containers import DockerContainer
 from aiohttp import web
 
 from app.config import ProxyConfig, ServiceConfig
@@ -1441,6 +1451,314 @@ class NoUIPlugin(_FakePlugin):
     """Passes everything through untouched and publishes no dashboard panel."""
 
 
+# ── NVIDIA driver, Docker and /proc ──
+
+BYTES_PER_MIB = 1024 * 1024
+_MILLIWATTS_PER_WATT = 1000
+_FAKE_GPU_HANDLE = "fake-gpu-0"
+_HELD_READ_TIMEOUT_S = 5.0
+_SHUTDOWN_WAIT_S = 0.5
+_PROC_FILE_PATTERN = re.compile(r"/proc/(\d+)/(cgroup|cmdline)")
+
+
+@dataclass
+class FakeGpuProcess:
+    """A process the fake driver lists on the GPU.
+
+    A vram_bytes of None is a process whose memory the driver will not tell.
+    A process with no container lives on the host. A process that has exited
+    is still listed by the driver but is gone from /proc, and reading its files
+    raises exit_error. A process that exits after its cgroup is read is gone
+    by the time its command line is read. A hidden process has /proc files the
+    host will not let anyone read.
+    """
+
+    pid: int
+    vram_bytes: Optional[int]
+    container: Optional[str] = None
+    command: str = ""
+    sm_utilization_pct: int = 0
+    is_compute: bool = True
+    is_graphics: bool = False
+    cgroup: Optional[str] = None
+    has_exited: bool = False
+    exits_after_cgroup: bool = False
+    exit_error: type[OSError] = FileNotFoundError
+    is_hidden: bool = False
+
+    @classmethod
+    def from_mib(
+        cls,
+        pid: int,
+        vram_mib: int,
+        container: Optional[str] = None,
+        command: str = "",
+        sm_utilization_pct: int = 0,
+    ) -> Self:
+        """A process holding a whole number of MiB."""
+        return cls(
+            pid=pid,
+            vram_bytes=vram_mib * BYTES_PER_MIB,
+            container=container,
+            command=command,
+            sm_utilization_pct=sm_utilization_pct,
+        )
+
+
+class FakeNvidiaHost:
+    """Scriptable stand-in for the NVIDIA driver, Docker and /proc of a GPU host.
+
+    A test sets the readings and the GPU processes it wants, then installs the
+    fake for the span of a with block. GPU memory is set here in MiB, with
+    extra bytes for part MiB amounts, and power is set in watts. Counters
+    record how often the driver was started, read, and shut down.
+    """
+
+    def __init__(
+        self,
+        total_vram_mib: int = _TOTAL_VRAM_MIB,
+        used_vram_mib: int = 0,
+        processes: Optional[list[FakeGpuProcess]] = None,
+    ) -> None:
+        self.total_vram_mib = total_vram_mib
+        self.used_vram_mib = used_vram_mib
+        self.reserved_vram_mib = 0
+        self.extra_total_bytes = 0
+        self.extra_used_bytes = 0
+        self.processes: list[FakeGpuProcess] = [] if processes is None else processes
+        self.stopped_containers: set[str] = set()
+        self.gpu_util_pct = 0
+        self.power_draw_w = 0.0
+        self.power_limit_w = 0.0
+        self.temperature_c = 0
+        self.gr_clock_mhz = 0
+        self.mem_clock_mhz = 0
+        self.pstate = 0
+        self.unsupported_queries: set[str] = set()
+        self.init_error: Optional[pynvml.NVMLError] = None
+        self.handle_error: Optional[pynvml.NVMLError] = None
+        self.shutdown_error: Optional[pynvml.NVMLError] = None
+        self.utilization_error: Optional[pynvml.NVMLError] = None
+        self.docker_error: Optional[Exception] = None
+        self.poll_fails = False
+        self.inits = 0
+        self.polls = 0
+        self.closes = 0
+        self.has_shut_down_during_read = False
+        self._listed: dict[int, FakeGpuProcess] = {}
+        self._read_gate: Optional[threading.Event] = None
+        self._read_held = threading.Event()
+        self._shutdown_called = threading.Event()
+
+    @staticmethod
+    def container_id(name: str) -> str:
+        """The full Docker id the fake gives a container name."""
+        return hashlib.sha256(name.encode()).hexdigest()
+
+    def current_used_vram_mib(self) -> int:
+        """Memory the driver reports in use, outside the reserved part."""
+        return self.used_vram_mib
+
+    def current_processes(self) -> list[FakeGpuProcess]:
+        """Processes the driver lists on the GPU."""
+        return self.processes
+
+    def running_containers(self) -> list[str]:
+        """Names of the containers Docker lists as running."""
+        names = [p.container for p in self.current_processes() if p.container]
+        return [n for n in dict.fromkeys(names) if n not in self.stopped_containers]
+
+    def hold_reads(self) -> None:
+        """Make each memory read wait until release_reads is called."""
+        self._read_gate = threading.Event()
+
+    def wait_for_held_read(self) -> None:
+        """Block until a memory read is waiting to be released.
+
+        Raises:
+            TimeoutError: If no read arrives.
+        """
+        if not self._read_held.wait(_HELD_READ_TIMEOUT_S):
+            raise TimeoutError("no GPU read arrived")
+
+    def wait_for_shutdown(self) -> None:
+        """Wait a short time for the driver to be shut down."""
+        self._shutdown_called.wait(_SHUTDOWN_WAIT_S)
+
+    def release_reads(self) -> None:
+        """Let held memory reads finish, and stop holding new ones."""
+        if self._read_gate is not None:
+            self._read_gate.set()
+
+    @contextmanager
+    def installed(self) -> Iterator[None]:
+        """Answer every driver, Docker and /proc call for the body of the block."""
+        original_read_text = Path.read_text
+
+        def read_text(path: Path, *args: str, **kwargs: str) -> str:
+            match = _PROC_FILE_PATTERN.fullmatch(str(path))
+            if match is None:
+                return original_read_text(path, *args, **kwargs)
+            return self._read_proc_file(int(match.group(1)), match.group(2))
+
+        with (
+            patch.multiple(
+                pynvml,
+                nvmlInit=self._init,
+                nvmlShutdown=self._shutdown,
+                nvmlDeviceGetHandleByIndex=self._get_handle,
+                nvmlDeviceGetMemoryInfo=self._get_memory_info,
+                nvmlDeviceGetUtilizationRates=self._get_utilization_rates,
+                nvmlDeviceGetPowerUsage=self._get_power_usage,
+                nvmlDeviceGetPowerManagementLimit=self._get_power_limit,
+                nvmlDeviceGetClockInfo=self._get_clock_info,
+                nvmlDeviceGetPowerState=self._get_power_state,
+                nvmlDeviceGetTemperature=self._get_temperature,
+                nvmlDeviceGetComputeRunningProcesses=self._list_compute_processes,
+                nvmlDeviceGetGraphicsRunningProcesses=self._list_graphics_processes,
+                nvmlDeviceGetProcessUtilization=self._get_process_utilization,
+            ),
+            patch("aiodocker.Docker", lambda: FakeDockerClient(self)),
+            patch.object(Path, "read_text", read_text),
+        ):
+            yield
+
+    def _check_supported(self, query: str) -> None:
+        """Fail the way the driver does for a reading this GPU lacks."""
+        if query in self.unsupported_queries:
+            raise pynvml.NVMLError(pynvml.NVML_ERROR_NOT_SUPPORTED)
+
+    def _init(self) -> None:
+        self.inits += 1
+        if self.init_error is not None:
+            raise self.init_error
+
+    def _shutdown(self) -> None:
+        self.closes += 1
+        self._shutdown_called.set()
+        if self.shutdown_error is not None:
+            raise self.shutdown_error
+
+    def _get_handle(self, _index: int) -> str:
+        if self.handle_error is not None:
+            raise self.handle_error
+        return _FAKE_GPU_HANDLE
+
+    def _get_memory_info(self, _handle: str, version: Optional[int] = None) -> SimpleNamespace:
+        """Report memory. The old format counts reserved memory as used."""
+        self.polls += 1
+        if self._read_gate is not None:
+            closes_before_hold = self.closes
+            self._read_held.set()
+            self._read_gate.wait(_HELD_READ_TIMEOUT_S)
+            if self.closes != closes_before_hold:
+                self.has_shut_down_during_read = True
+        if self.poll_fails:
+            raise pynvml.NVMLError(pynvml.NVML_ERROR_UNKNOWN)
+        total = self.total_vram_mib * BYTES_PER_MIB + self.extra_total_bytes
+        reserved = self.reserved_vram_mib * BYTES_PER_MIB
+        in_use = self.current_used_vram_mib() * BYTES_PER_MIB + self.extra_used_bytes
+        free = total - reserved - in_use
+        if version != pynvml.nvmlMemory_v2:
+            in_use += reserved
+        return SimpleNamespace(total=total, reserved=reserved, used=in_use, free=free)
+
+    def _get_utilization_rates(self, _handle: str) -> SimpleNamespace:
+        self._check_supported("nvmlDeviceGetUtilizationRates")
+        return SimpleNamespace(gpu=self.gpu_util_pct, memory=0)
+
+    def _get_power_usage(self, _handle: str) -> int:
+        return round(self.power_draw_w * _MILLIWATTS_PER_WATT)
+
+    def _get_power_limit(self, _handle: str) -> int:
+        self._check_supported("nvmlDeviceGetPowerManagementLimit")
+        return round(self.power_limit_w * _MILLIWATTS_PER_WATT)
+
+    def _get_clock_info(self, _handle: str, clock: int) -> int:
+        self._check_supported("nvmlDeviceGetClockInfo")
+        if clock == pynvml.NVML_CLOCK_GRAPHICS:
+            return self.gr_clock_mhz
+        return self.mem_clock_mhz
+
+    def _get_power_state(self, _handle: str) -> int:
+        self._check_supported("nvmlDeviceGetPowerState")
+        return self.pstate
+
+    def _get_temperature(self, _handle: str, _sensor: int) -> int:
+        self._check_supported("nvmlDeviceGetTemperature")
+        return self.temperature_c
+
+    def _list_processes(self, is_graphics: bool) -> list[SimpleNamespace]:
+        """List compute or graphics processes and remember them for /proc."""
+        listed = [
+            p for p in self.current_processes()
+            if (p.is_graphics if is_graphics else p.is_compute)
+        ]
+        self._listed.update({p.pid: p for p in listed})
+        return [SimpleNamespace(pid=p.pid, usedGpuMemory=p.vram_bytes) for p in listed]
+
+    def _list_compute_processes(self, _handle: str) -> list[SimpleNamespace]:
+        return self._list_processes(is_graphics=False)
+
+    def _list_graphics_processes(self, _handle: str) -> list[SimpleNamespace]:
+        return self._list_processes(is_graphics=True)
+
+    def _get_process_utilization(self, _handle: str, _since: int) -> list[SimpleNamespace]:
+        """Report busy samples, failing with not found when there are none."""
+        if self.utilization_error is not None:
+            raise self.utilization_error
+        samples = [
+            SimpleNamespace(pid=p.pid, smUtil=p.sm_utilization_pct)
+            for p in self.current_processes()
+            if p.sm_utilization_pct
+        ]
+        if not samples:
+            raise pynvml.NVMLError(pynvml.NVML_ERROR_NOT_FOUND)
+        return samples
+
+    def _read_proc_file(self, pid: int, name: str) -> str:
+        """Serve /proc cgroup and cmdline files for processes the driver listed."""
+        process = self._listed.get(pid)
+        if process is None:
+            raise FileNotFoundError(f"/proc/{pid}/{name}")
+        if process.has_exited:
+            raise process.exit_error(f"/proc/{pid}/{name}")
+        if process.is_hidden:
+            raise PermissionError(f"/proc/{pid}/{name}")
+        if name == "cmdline":
+            return "".join(f"{part}\0" for part in process.command.split())
+        if process.exits_after_cgroup:
+            process.has_exited = True
+        if process.cgroup is not None:
+            return process.cgroup
+        if process.container is None:
+            return "0::/user.slice/user-1000.slice/session-1.scope\n"
+        return f"0::/docker/{self.container_id(process.container)}\n"
+
+
+class FakeDockerClient:
+    """The part of the Docker client that lists running containers."""
+
+    def __init__(self, host: FakeNvidiaHost) -> None:
+        self.containers = self
+        self._host = host
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, *_exc_info: Optional[BaseException]) -> None:
+        return None
+
+    async def list(self) -> list[DockerContainer]:
+        """List the containers the host has running, or fail if told to."""
+        if self._host.docker_error is not None:
+            raise self._host.docker_error
+        return [
+            DockerContainer(self, Id=FakeNvidiaHost.container_id(name), Names=[f"/{name}"])
+            for name in self._host.running_containers()
+        ]
+
+
 # ── Fixtures ──
 
 
@@ -1651,9 +1969,7 @@ async def token_stats_plugin() -> AsyncIterator[tuple[OpenAITokenStats, Publishe
 def mock_subprocess_exec() -> Iterator[None]:
     """Mock asyncio.create_subprocess_exec for all tests.
 
-    Prevents tests from calling real subprocesses (docker restart,
-    nvidia_docker_usage.py, etc.) which would fail or have side effects
-    on machines with/without GPUs.
+    Keeps tests from running real commands such as docker restart.
 
     Returns a mock subprocess that succeeds by default (exit code 0,
     empty stdout/stderr). Tests that need specific subprocess behavior

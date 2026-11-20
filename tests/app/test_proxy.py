@@ -16,7 +16,6 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import AsyncIterator, Awaitable, Callable, Iterator, Optional, override
-from unittest.mock import patch
 
 import pytest
 from aiohttp import (
@@ -31,7 +30,7 @@ from aiohttp import (
 )
 
 from app.config import ProxyConfig, ServiceConfig
-from app.gpu_monitor import LibContainerUsage, LibGpuStats, RealClock
+from app.gpu_monitor import RealClock
 from app.plugins.base import PluginBase
 from app.plugins.manager import PluginManager
 from app.plugins.openai_guard_rail import OpenAIGuardRail
@@ -48,6 +47,8 @@ from tests.app.conftest import (
     CustomResponsePlugin,
     DelegatePlugin,
     FailingPlugin,
+    FakeGpuProcess,
+    FakeNvidiaHost,
     ForwardToBackupPlugin,
     GpuDelegatePlugin,
     HeaderPlugin,
@@ -77,6 +78,7 @@ HTTP_SERVICE_UNAVAILABLE = 503
 HTTP_LOOP_DETECTED = 508
 
 TOTAL_VRAM = 24576
+FIRST_CONTAINER_PID = 4000
 VRAM_BUDGET = 20480
 LARGE_SERVICE_VRAM = 16384
 SMALL_SERVICE_VRAM = 4096
@@ -255,21 +257,13 @@ class Reply:
         return self.body.decode()
 
 
-class FakeGpu:
-    """Scriptable stand-in for the NVIDIA library that GpuMonitor polls."""
+class FakeGpu(FakeNvidiaHost):
+    """Scriptable GPU host whose containers hold VRAM until a test frees it."""
 
     def __init__(self) -> None:
+        super().__init__(total_vram_mib=TOTAL_VRAM)
         self.available_vram_mib: int = TOTAL_VRAM
         self.containers: dict[str, int] = {}
-        self.gpu_util_pct: int = 0
-        self.power_draw_w: float = 0.0
-        self.power_limit_w: float = 0.0
-        self.temperature_c: int = 0
-        self.gr_clock_mhz: int = 0
-        self.mem_clock_mhz: int = 0
-        self.pstate: str = "P0"
-        self.poll_fails: bool = False
-        self.polls: int = 0
         self.freed_by: dict[str, Path] = {}
 
     def occupy(
@@ -307,50 +301,24 @@ class FakeGpu:
             if name not in self.freed_by or not self.freed_by[name].exists()
         }
 
-    def _free_vram(self) -> int:
-        """Free VRAM, counting back anything released by a marker."""
+    @override
+    def current_used_vram_mib(self) -> int:
+        """Used VRAM, counting back anything released by a marker."""
         held = self._held()
         returned = sum(v for k, v in self.containers.items() if k not in held)
-        return self.available_vram_mib + returned
+        return TOTAL_VRAM - self.available_vram_mib - returned
 
-    async def init(self) -> None:
-        """Match the library's async initialization hook."""
-
-    async def close(self) -> None:
-        """Match the library's async shutdown hook."""
-
-    async def get_stats(self) -> LibGpuStats:
-        """Return the GPU-wide statistics the test has configured."""
-        self.polls += 1
-        if self.poll_fails:
-            raise RuntimeError("nvml query failed")
-        free = self._free_vram()
-        return LibGpuStats(
-            total_vram_mib=TOTAL_VRAM,
-            used_vram_mib=TOTAL_VRAM - free,
-            available_vram_mib=free,
-            gpu_utilization_pct=self.gpu_util_pct,
-            power_draw_w=self.power_draw_w,
-            power_limit_w=self.power_limit_w,
-            gr_clock_mhz=self.gr_clock_mhz,
-            mem_clock_mhz=self.mem_clock_mhz,
-            pstate=self.pstate,
-            temperature_c=self.temperature_c,
-            reserved_vram_mib=0,
-        )
-
-    async def get_container_usage(self) -> list[LibContainerUsage]:
-        """Return per-container VRAM usage the test has configured."""
-        if self.poll_fails:
-            raise RuntimeError("nvml query failed")
+    @override
+    def current_processes(self) -> list[FakeGpuProcess]:
+        """One GPU process for each container still holding VRAM."""
         return [
-            LibContainerUsage(
-                name=name,
-                processes=[],
-                total_vram_mib=vram,
-                total_gpu_utilization_pct=self.gpu_util_pct,
+            FakeGpuProcess.from_mib(
+                pid=FIRST_CONTAINER_PID + index,
+                vram_mib=vram,
+                container=name,
+                sm_utilization_pct=self.gpu_util_pct,
             )
-            for name, vram in self._held().items()
+            for index, (name, vram) in enumerate(self._held().items())
         ]
 
 
@@ -651,7 +619,7 @@ StartUpstream = Callable[..., Awaitable[UpstreamServer]]
 def fake_gpu() -> Iterator[FakeGpu]:
     """Replace the NVIDIA library the GPU monitor polls with a scriptable fake."""
     gpu = FakeGpu()
-    with patch("app.gpu_monitor.LibGpuUsageMonitor", lambda: gpu):
+    with gpu.installed():
         yield gpu
 
 
