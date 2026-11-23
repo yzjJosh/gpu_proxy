@@ -25,6 +25,8 @@ services:
 
 `LazyStartContainer` works with any container. The other plugins need a server with an OpenAI-compatible API, like vLLM, SGLang or llama.cpp.
 
+To write your own plugin, see [Writing your own plugin](#writing-your-own-plugin).
+
 ## LazyStartContainer
 
 When a request arrives for a service whose container is stopped, this plugin starts the container. Pair the plugin with `eviction_command: "docker stop {container}"` for servers that load their model as soon as they start.
@@ -132,3 +134,22 @@ tool_call_prune_exclusions:
   - tool_name_regex: "^shell$"
     tool_args_regex: "git (status|diff)"
 ```
+
+## Writing your own plugin
+
+Add a Python file to `app/plugins/` with a subclass of `PluginBase` from `app/plugins/base.py`. The proxy loads every plugin file at startup. In `config.yaml`, use the class name as the plugin's `type`.
+
+The proxy creates one copy of the plugin for each service that uses it. The plugin's `config` block arrives as a dictionary in `self.config`.
+
+Your class must define `name()`. Then override the hooks you need:
+
+| Hook | When the proxy calls it |
+| --- | --- |
+| `on_request` | Before it sends a request to the model server. Return the headers, body and path to send instead. |
+| `on_response_headers` | Before it sends the response headers to your app. Return the headers to send. |
+| `on_response_chunk` | For each piece of the response body. Return the bytes to send to your app. |
+| `prepare_target` | Before it sends a request to the model server. Use it to get the server ready, like starting a container. |
+| `overridden_paths` and `handle_overridden_request` | For requests to the paths you list. Your plugin handles these requests itself. It can answer them directly or pass them on to the model server and change the reply. |
+| `init_ui` | Once at startup. It gets a function your plugin can call at any time to show its own panel on the dashboard. |
+
+When you override `on_request` or `on_response_chunk`, call the `super()` version too, like the bundled plugins do. The base class uses those calls to track which requests are still running.
