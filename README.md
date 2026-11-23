@@ -34,6 +34,16 @@ You probably don't need gpu-proxy if:
 3. If there isn't enough VRAM, the request waits while the proxy evicts other containers. It evicts idle containers first, starting with the least important. It only evicts a busy container when a more important service needs room. Before evicting a busy container, the proxy gives it time to finish its current requests. Once there's room, the proxy sends the request on.
 4. If the proxy can't free enough VRAM in time, it sends the request to the service's backup server, such as one running the same model on the CPU. Without a backup, the proxy returns a 503 error.
 
+## Plugins
+
+Plugins work on a service's traffic as it passes through the proxy. You choose which plugins each service uses in `config.yaml`. A plugin can:
+
+- Change a request before it reaches your model server. For example, it can set `temperature` on every LLM request, or trim old context from a long agent chat.
+- Check or change a response before it reaches your app. For example, the LLM guardrail plugin catches a model that repeats itself or makes a broken tool call, and asks the model to try again.
+- Get the server ready before the request reaches it, like starting a stopped container.
+
+gpu-proxy comes with plugins for LLM guardrails, context trimming, setting request fields, live token stats and starting stopped containers. The [plugins page](guide/plugins.md) explains each one and how to write your own.
+
 ## Requirements
 
 - Linux with an NVIDIA GPU. The proxy only manages GPU 0.
@@ -107,7 +117,7 @@ services:
       - /prompt
 ```
 
-The proxy evicts `image-gen` with the default `docker restart`, which leaves ComfyUI empty until its next request. A restart would load `llm`'s model straight back, so `llm` is evicted with `docker stop` instead, and the [`LazyStartContainer`](guide/plugins.md#lazystartcontainer) plugin starts it again when a request arrives.
+The proxy evicts `image-gen` with the default `docker restart`, which leaves ComfyUI with no model loaded until its next request. A restart would load `llm`'s model straight back, so the proxy evicts `llm` with `docker stop` instead. The [`LazyStartContainer`](guide/plugins.md#lazystartcontainer) plugin starts the `llm` container again when a request arrives.
 
 ### 4. Run it
 
@@ -143,11 +153,17 @@ In OpenAI-compatible apps, set the base URL to `http://llm.lan:8080/v1`. Point o
 
 ### 6. Open the dashboard
 
-Open `http://gpu-proxy.lan:8080` in your browser to watch your services. Once you see how much VRAM each service really uses, update its `vram_budget` in `config.yaml` to match.
+Open `http://gpu-proxy.lan:8080` in your browser to watch your services. The dashboard shows the GPU's load and free VRAM, how much VRAM each container uses, and each service's priority, health and state.
+
+<p align="center">
+  <img src="guide/images/dashboard.png" width="900" alt="The gpu-proxy dashboard, showing GPU stats, VRAM used by each container, and each service's priority, health, state and VRAM use.">
+</p>
+
+Use the dashboard to tune each service's `vram_budget` in `config.yaml`. Watch the service while it handles real requests, and set its budget to the most VRAM you see it use. An idle service can use far less, like ComfyUI in the screenshot.
 
 ### 7. Start it on boot
 
-Stop the proxy from step 4 if it's still running. The included `gpu-proxy.service` file expects the project in `/var/gpu_proxy`, so edit the paths in that file if you cloned the repository somewhere else. Under systemd, the proxy writes its logs to `/var/log/gpu-proxy.log`.
+Stop the proxy from step 4 if it's still running. The included `gpu-proxy.service` file expects the project in `/var/gpu_proxy`, so edit the paths in that file if you cloned the repository somewhere else.
 
 ```bash
 sudo cp gpu-proxy.service /etc/systemd/system/
@@ -155,10 +171,12 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now gpu-proxy
 ```
 
+Under systemd, the proxy writes its logs to `/var/log/gpu-proxy.log`.
+
 ## Learn more
 
 - The [configuration reference](guide/configuration.md) explains every setting, including backups, health checks, priorities and services on other machines.
-- The [plugins page](guide/plugins.md) explains `LazyStartContainer` and the plugins for OpenAI-compatible servers. The OpenAI plugins can catch bad replies, trim old context, set request fields and show token speed.
+- The [plugins page](guide/plugins.md) explains each plugin that comes with gpu-proxy and its options.
 
 ## License
 
