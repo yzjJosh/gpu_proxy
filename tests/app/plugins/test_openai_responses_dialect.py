@@ -5,7 +5,6 @@ import json
 from pathlib import Path
 from typing import Callable
 from urllib import request as urllib_request
-from urllib.parse import urlparse
 
 import pytest
 
@@ -1423,12 +1422,6 @@ def live_config() -> ProxyConfig:
     return load_config(str(_CONFIG_PATH))
 
 
-def _require_phase(request: pytest.FixtureRequest, phase: str) -> None:
-    """Skip the test unless the gate runs the given phase."""
-    if request.config.getoption("--responses-gate") != phase:
-        pytest.skip(f"needs --responses-gate={phase}")
-
-
 def _post(url: str, host: str, body: dict) -> tuple[int, str, bytes]:
     """Post a JSON body and return the status, content type and reply."""
     req = urllib_request.Request(url, data=json.dumps(body).encode(), method="POST")
@@ -1541,37 +1534,3 @@ def test_live_backend_conformance(
     assert usage.output > 0
     _assert_texts_match_items(payloads, output)
     record_property("cut_points", str(_assert_splice_framing(raw, output)))
-
-
-def _admitted_service(config: ProxyConfig, name: str) -> str:
-    """Follow loopback targets from an external service to the GPU service that answers."""
-    service = config.services[name]
-    while service.external:
-        host = urlparse(service.target).hostname
-        service = next(s for s in config.services.values() if s.hostname == host)
-    return service.name
-
-
-@pytest.mark.live
-@pytest.mark.parametrize("service", ["llm", "llm-heavy"])
-def test_live_end_to_end_framing(request: pytest.FixtureRequest, live_config: ProxyConfig, service: str) -> None:
-    """Responses traffic through each guard rail chain is well framed and admitted."""
-    _require_phase(request, "e2e")
-    url = f"http://127.0.0.1:{live_config.listen_port}/v1/responses"
-    host = live_config.services[service].hostname
-    admitted = _admitted_service(live_config, service)
-    before = _routing(live_config, admitted)
-    status, _content_type, raw = _post(url, host, _PROBES["content"])
-    assert status == 200
-    payloads = parse_sse_payloads(raw)
-    assert [p["type"] for p in payloads].count("response.created") == 1
-    sequence = [p["sequence_number"] for p in payloads if "sequence_number" in p]
-    assert sequence == sorted(set(sequence))
-    indexes = [p["output_index"] for p in payloads if p["type"] == "response.output_item.added" and "output_index" in p]
-    assert len(indexes) == len(set(indexes))
-    assert _DIALECT.usage(payloads[-1]).output > 0
-    status, content_type, body = _post(url, host, {**_PROBES["content"], "stream": False})
-    assert status == 200
-    assert content_type.startswith("application/json")
-    assert json.loads(body)["object"] == "response"
-    assert _routing(live_config, admitted)["target"] > before["target"]

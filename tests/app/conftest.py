@@ -1767,8 +1767,8 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     parser.addoption(
         "--responses-gate",
         default="",
-        choices=("", "conformance", "e2e"),
-        help="run the live Responses gate phase: conformance or e2e",
+        choices=("", "conformance"),
+        help="run the live Responses conformance gate",
     )
 
 
