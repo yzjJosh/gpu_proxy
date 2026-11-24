@@ -4,7 +4,7 @@ import json
 import logging
 import time
 from collections import OrderedDict, deque
-from typing import AsyncIterator, Awaitable, Callable, Self
+from typing import AsyncIterator, Awaitable, Callable, Iterable, Self
 from urllib.parse import urlparse
 
 from app.config import ServiceConfig
@@ -29,6 +29,8 @@ from app.plugins.utils import (
 )
 
 _TOOL_CALL_LOOP_DETECTOR_MIN_DISTANCE = 5
+_FINGERPRINT_MODULUS = (1 << 61) - 1
+_FINGERPRINT_BASE = 1_000_003
 _RESUMPTION_LRU_SIZE = 50
 
 _CHAT_DIALECT = ChatCompletionsDialect()
@@ -283,12 +285,25 @@ class _StreamLoopDetector:
     so the caller can abort the stream.
     """
 
-    def __init__(self, min_block_size: int = 50) -> None:
+    def __init__(self, min_block_size: int = 50, loop_free_history: str = "") -> None:
+        """Create a detector that already holds some history.
+
+        Args:
+            min_block_size: The shortest block that counts as a repeat.
+            loop_free_history: Text already known to hold no loop, recorded without checking.
+        """
         self.buffer = ""
         self.min_block_size = min_block_size
-        self.seen_hashes = {}
+        # Each entry records where a matching window ends.
+        self.seen_hashes: dict[int, int | list[int]] = {}
         self._last_start_idx = 0
-        self._last_added_hashes: dict[int, list[int]] = {}
+        self._positions_recorded_by_latest_feed = range(0)
+        self._running_fingerprints = [0]
+        self._powers_of_base = [1]
+        # The history is not a feed, so pop_last cannot undo it.
+        self._append_to_buffer(loop_free_history)
+        for position in self._positions_after(0):
+            self._remember_window_ending_at(position, self._hash_of_window_ending_at(position))
 
     def feed(self, delta: str) -> bool:
         """Feed a chunk of text into the detector.
@@ -305,33 +320,91 @@ class _StreamLoopDetector:
         """
         if not delta:
             return False
-
-        self._last_start_idx = len(self.buffer)
-        self._last_added_hashes = {}
-        self.buffer += delta
-        end_idx = len(self.buffer)
-
-        for i in range(max(self.min_block_size, self._last_start_idx + 1), end_idx + 1):
-            anchor_hash = hash(self.buffer[i - self.min_block_size : i])
-
-            if anchor_hash in self.seen_hashes:
-                for prev_end in self.seen_hashes[anchor_hash]:
-                    distance = i - prev_end
-                    if distance >= self.min_block_size and i >= 2 * distance:
-                        if (
-                            self.buffer[i - 2 * distance : i - distance]
-                            == self.buffer[i - distance : i]
-                        ):
-                            return True
-
-            if anchor_hash in self.seen_hashes:
-                self.seen_hashes[anchor_hash].append(i)
-                self._last_added_hashes.setdefault(anchor_hash, []).append(i)
-            else:
-                self.seen_hashes[anchor_hash] = [i]
-                self._last_added_hashes[anchor_hash] = [i]
-
+        old_length = len(self.buffer)
+        self._last_start_idx = old_length
+        self._append_to_buffer(delta)
+        new_positions = self._positions_after(old_length)
+        for position in new_positions:
+            window_hash = self._hash_of_window_ending_at(position)
+            is_seen_window = window_hash in self.seen_hashes
+            if is_seen_window and self._loop_ends_at(position, window_hash):
+                self._positions_recorded_by_latest_feed = range(new_positions.start, position)
+                return True
+            self._remember_window_ending_at(position, window_hash)
+        self._positions_recorded_by_latest_feed = new_positions
         return False
+
+    def _append_to_buffer(self, text: str) -> None:
+        """Add text to the end of the buffer."""
+        self.buffer += text
+        for char in text:
+            next_fingerprint = self._running_fingerprints[-1] * _FINGERPRINT_BASE + ord(char)
+            self._running_fingerprints.append(next_fingerprint % _FINGERPRINT_MODULUS)
+            next_power = self._powers_of_base[-1] * _FINGERPRINT_BASE
+            self._powers_of_base.append(next_power % _FINGERPRINT_MODULUS)
+
+    def _positions_after(self, start: int) -> range:
+        """Buffer positions after start that have a full window of min_block_size characters before them."""
+        return range(max(self.min_block_size, start + 1), len(self.buffer) + 1)
+
+    def _hash_of_window_ending_at(self, position: int) -> int:
+        """The hash of the min_block_size characters right before position."""
+        return hash(self.buffer[position - self.min_block_size : position])
+
+    def _loop_ends_at(self, position: int, window_hash: int) -> bool:
+        """Whether a long enough block repeats twice in a row right before position, for a seen window."""
+        for earlier_position in self._newest_first(self.seen_hashes[window_hash]):
+            if 2 * earlier_position < position:
+                # This position and every older one are too far back for the block to fit twice.
+                break
+            block_length = position - earlier_position
+            if block_length < self.min_block_size:
+                continue
+            if self._block_repeats_twice_before(position, block_length):
+                return True
+        return False
+
+    @staticmethod
+    def _newest_first(positions: int | list[int]) -> Iterable[int]:
+        """The positions stored for one window hash, newest first."""
+        if isinstance(positions, int):
+            return (positions,)
+        return reversed(positions)
+
+    def _remember_window_ending_at(self, position: int, window_hash: int) -> None:
+        """Remember that a window with this hash ends at position."""
+        positions = self.seen_hashes.get(window_hash)
+        if positions is None:
+            self.seen_hashes[window_hash] = position
+        elif isinstance(positions, int):
+            self.seen_hashes[window_hash] = [positions, position]
+        else:
+            positions.append(position)
+
+    def _forget_window_ending_at(self, position: int) -> None:
+        """Forget the window that ends at position, which must be the newest one with its hash."""
+        window_hash = self._hash_of_window_ending_at(position)
+        positions = self.seen_hashes[window_hash]
+        if isinstance(positions, list) and len(positions) > 1:
+            positions.pop()
+        else:
+            del self.seen_hashes[window_hash]
+
+    def _fingerprint_of_buffer_between(self, start: int, end: int) -> int:
+        """Return the fingerprint of the selected text."""
+        shift = self._powers_of_base[end - start]
+        fingerprint = self._running_fingerprints[end] - self._running_fingerprints[start] * shift
+        return fingerprint % _FINGERPRINT_MODULUS
+
+    def _block_repeats_twice_before(self, position: int, block_length: int) -> bool:
+        """Whether the last block_length characters before position appear twice in a row."""
+        middle = position - block_length
+        start = middle - block_length
+        first_fingerprint = self._fingerprint_of_buffer_between(start, middle)
+        second_fingerprint = self._fingerprint_of_buffer_between(middle, position)
+        if first_fingerprint != second_fingerprint:
+            return False
+        return self.buffer[start:middle] == self.buffer[middle:position]
 
     def pop_last(self) -> bool:
         """Undo the most recent successful ``feed()`` call.
@@ -344,17 +417,14 @@ class _StreamLoopDetector:
             ``True`` if a feed was undone, ``False`` if there was nothing to undo
             (no prior feed, or previous undo already consumed the state).
         """
-        if not self._last_added_hashes:
+        if not self._positions_recorded_by_latest_feed:
             return False
+        for position in reversed(self._positions_recorded_by_latest_feed):
+            self._forget_window_ending_at(position)
         self.buffer = self.buffer[: self._last_start_idx]
-        for h, indices in self._last_added_hashes.items():
-            old = self.seen_hashes.get(h)
-            for idx in indices:
-                if old and idx in old:
-                    old.remove(idx)
-            if not old:
-                del self.seen_hashes[h]
-        self._last_added_hashes = {}
+        del self._running_fingerprints[self._last_start_idx + 1 :]
+        del self._powers_of_base[self._last_start_idx + 1 :]
+        self._positions_recorded_by_latest_feed = range(0)
         return True
 
 
@@ -557,6 +627,7 @@ class _DeltaSerializer:
             )
             self._pending_tool_call_bytes.clear()
             self._pending_tool_call_delta = {"type": "tool_call"}
+            self._last_separator = "[tool_call]"
 
         if tp == "tool_call":
             # Valid tool call delta. Cache the raw bytes and delta until it completes.
@@ -729,7 +800,11 @@ class _Session:
             tc_text, _TOOL_CALL_LOOP_DETECTOR_MIN_DISTANCE, 5
         )
         if safe_start < len(tc_text):
-            self._tool_call_dup_detector.feed(tc_text[safe_start:])
+            # The reversed scan found no loop here, and a loop read backwards is still a loop.
+            self._tool_call_dup_detector = _StreamLoopDetector(
+                min_block_size=_TOOL_CALL_LOOP_DETECTOR_MIN_DISTANCE,
+                loop_free_history=tc_text[safe_start:],
+            )
 
     @staticmethod
     def _build_tool_call_hint(tc_text: str) -> str:

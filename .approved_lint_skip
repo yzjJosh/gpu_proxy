@@ -3,6 +3,6 @@ app/plugins/lazy_start_container.py:53:coding.exported-api-unused:plugin classes
 app/plugins/openai_chat_modifier.py:23:coding.exported-api-unused:plugin classes are loaded by the plugin manager with spec.loader.exec_module and found by name from config, so no production file imports them
 app/plugins/openai_context_modifier.py:95:coding.exported-api-unused:plugin classes are loaded by the plugin manager with spec.loader.exec_module and found by name from config, so no production file imports them
 app/plugins/openai_embedding_modifier.py:14:coding.exported-api-unused:plugin classes are loaded by the plugin manager with spec.loader.exec_module and found by name from config, so no production file imports them
-app/plugins/openai_guard_rail.py:963:coding.exported-api-unused:plugin classes are loaded by the plugin manager with spec.loader.exec_module and found by name from config, so no production file imports them
+app/plugins/openai_guard_rail.py:1038:coding.exported-api-unused:plugin classes are loaded by the plugin manager with spec.loader.exec_module and found by name from config, so no production file imports them
 app/plugins/openai_reranking_modifier.py:14:coding.exported-api-unused:plugin classes are loaded by the plugin manager with spec.loader.exec_module and found by name from config, so no production file imports them
 app/watchdog.py:59:coding.access-private:sys._current_frames() is the only way to capture the main thread's stack from the background thread; CPython exposes no public API for reading another thread's frames

@@ -1,6 +1,11 @@
 import asyncio
 import json
 import logging
+import multiprocessing
+import random
+import time
+import uuid
+from multiprocessing.connection import Connection
 from typing import Awaitable, Callable, Optional
 from unittest.mock import MagicMock, AsyncMock
 
@@ -1340,6 +1345,26 @@ class TestStreamValidationAndRetry:
         assert upstream.calls == 2
         _assert_retry_names_tool_call(upstream, tc_name)
 
+    async def test_history_tool_calls_repeated_in_order_trigger_retry(self) -> None:
+        """Repeating the history's tool calls in order is a loop, whatever was thought between them."""
+        upstream = _Upstream(
+            sse_tool_call("tc3", "web_fetch", {"url": "a"})
+            + sse_tool_call("tc4", "web_fetch", {"url": "b"})
+            + sse_finish_reason("1", "stop")
+            + sse_done(),
+            _recovered_reply(),
+        )
+        history = _request([
+            _user_message(),
+            _assistant_tool_call("web_fetch", '{"url": "a"}', "tc1", reasoning="Fetch page a first."),
+            _tool_result("page a", "tc1"),
+            _assistant_tool_call("web_fetch", '{"url": "b"}', "tc2", reasoning="Now fetch page b."),
+            _tool_result("page b", "tc2"),
+        ])
+        plugin = OpenAIGuardRail({"dedup_tool_calls": True})
+        await _drive_result(plugin, upstream.forward, _make_client_response(), history)
+        assert upstream.calls == 2, "history calls a, b repeated as a, b were not caught as a loop"
+
     async def test_dedup_tool_call_repeated_args_no_retry(self) -> None:
         """Tool call with repeated content in arguments should not trigger dedup."""
         plugin = OpenAIGuardRail({"dedup_tool_calls": True})
@@ -2386,3 +2411,417 @@ class TestChatChunkPieces:
         written, client = await _drive_wire(OpenAIGuardRail({"dedup_tool_calls": True}), CHAT_WIRE, upstream, _first_turn(CHAT_WIRE))
         assert written == packed + b_rest + finish
         assert _writes(client)[:3] == [packed, b"", b_rest + finish]
+
+
+# The guard rail set up the way the production config runs it.
+_PRODUCTION_GUARD_CONFIG = {
+    "break_loops": True,
+    "min_loop_distance": 150,
+    "force_final_output": True,
+    "dedup_tool_calls": True,
+    "validate_tool_calls": True,
+}
+_ANSWER_BUDGET_S = 1.0
+_CHILD_START_TIMEOUT_S = 60.0
+
+# A made up long agent run. After one user turn the model spends some
+# opening turns searching the web and reading background tasks, mostly two
+# calls a turn. Then it re-reads one task result a turn, and before each call
+# writes nearly the same plan to finish, with a numbered list of the same
+# evidence task ids and short notes.
+_LONG_RUN_SEED = 7
+_OPENING_TURNS = 42
+# Every eighth opening turn makes one call, the others make two.
+_OPENING_TURNS_PER_ONE_CALL_TURN = 8
+# The opening turn where the model writes out a long plan.
+_OPENING_LONG_TURN = 30
+_OPENING_LONG_TURN_SENTENCES = 50
+_OPENING_SENTENCE_COUNTS = (1, 1, 1, 1, 1, 1, 2, 3, 4, 8)
+_OPENING_TOOLS = ("task", "web_fetch", "google_search", "github", "brave_search")
+_OPENING_TOOL_WEIGHTS = (36, 27, 9, 6, 1)
+_FETCH_PROMPT_MIN_SENTENCES = 2
+_FETCH_PROMPT_MAX_SENTENCES = 5
+_CLOSING_TURNS = 150
+# Closing turns that mention a version change, written with an arrow.
+_VERSION_NOTE_TURNS = (33, 133)
+_EVIDENCE_TASKS = 14
+_LISTED_EVIDENCE_TASKS = 13
+_OPENING_ONLY_TASKS = 22
+# Values repeat to make some of them more likely.
+_TASK_RESULT_MAX_CHARS = (500,) * 8 + (25000,) * 6 + (600,) * 5 + (5000,) * 3 + (
+    400, 800, 50000, 1000, 3000, 1500, 2000, 900, 4000, 700,
+)
+_TASK_RESULT_OFFSETS = (0,) * 30 + (1500, 3000, 5000)
+_CLOSING_TURN_WITHOUT_LIST_CHANCE = 0.15
+_SAYS_WHICH_IDS_TO_CITE_CHANCE = 0.7
+_SAYS_NUMBERS_WERE_CHECKED_CHANCE = 0.4
+_TWO_LINE_LIST_END_CHANCE = 0.5
+_SAME_LIST_ORDER_CHANCE = 0.45
+_DROP_LATE_ENTRY_CHANCE = 0.3
+# The entries near the end of the list, one of which is sometimes left out.
+_LATE_ENTRIES = 3
+_SWAP_NEIGHBOURS_CHANCE = 0.5
+_ADD_UNLISTED_TASK_CHANCE = 0.02
+_SAME_NOTE_CHANCE = 0.6
+_EVIDENCE_DETAILS_PER_TASK = 5
+_OPENING_SHORT_SENTENCES = (
+    "Let me pull both of those task outputs now.",
+    "Let me check both task results.",
+    "Let me fetch the second source too.",
+    "Time to look up the reported scores.",
+    "Both tasks are started, let me read them.",
+    "I will open that whole page next.",
+)
+_OPENING_PLAN_SENTENCES = (
+    "The question asks for scores reported by a paper and by a blog post.",
+    "Results tables come first, after that the benchmark part of the blog.",
+    "The search results point to the paper page and its PDF.",
+    "The blog post may only show the numbers in a chart.",
+    "I need the exact percentages, not rounded ones.",
+    "The repo might hold the benchmark code and the raw scores.",
+    "I will start background tasks for each page and read them later.",
+)
+_LONG_PLAN_SENTENCES = _OPENING_PLAN_SENTENCES + (
+    "Some pages failed to load, so I will try the PDF — it usually has the tables.",
+)
+# Each of these makes one sentence from one pick in every slot.
+_SAYS_DATA_IS_IN = (
+    ("I have now gathered", "I now have", "I've collected", "Now I have", "I have verified", "I have read",
+     "I've gathered", "I have checked", "At this point I have", "By now I have", "I finally have"),
+    ("comprehensive", "extensive", "detailed", "all the key", "enough", "the exact", "complete", "solid",
+     "thorough", "consistent", "reliable", "plenty of"),
+    ("data from the two main sources.", "numbers from both sources.",
+     "hard numbers from the paper and the blog.", "results from every key task.",
+     "figures for both frameworks.", "benchmark numbers from all sources.", "task results I need.",
+     "evidence for each claim.", "scores across all reported models.",
+     "material from the paper, blog and repo."),
+)
+_SAYS_ANSWER_COMES_NEXT = (
+    ("Let me", "Now let me", "Next I will", "I will now", "Time to", "I should", "It is time to"),
+    ("compile", "write", "compose", "put together", "build", "assemble", "prepare", "finish", "draft",
+     "produce"),
+    ("the final JSON deliverable", "my final JSON response", "the final answer", "my final response",
+     "a final JSON answer", "our deliverable JSON"),
+    (".", "now.", "with the evidence task IDs.", "with the summary.", "using these results.",
+     "in the requested format."),
+)
+_SAYS_WHICH_IDS_TO_CITE = (
+    ("I'll", "I will", "Let me", "I want to", "I plan to", "I should"),
+    ("include", "cite", "select", "list", "keep", "reference", "mention"),
+    ("key", "the most relevant", "my most important", "all evidence", "verified"),
+    ("task IDs that contain unique numbers.", "task IDs holding the relevant data.",
+     "task IDs whose results I have read.", "task IDs with the strongest numbers.",
+     "task IDs that back each claim.", "task IDs from the results above."),
+)
+_SAYS_NUMBERS_WERE_CHECKED = (
+    ("I have verified", "I double checked", "I confirmed", "I cross checked", "I compared", "I reread"),
+    ("headline numbers", "every percentage", "all table values", "key quantitative data", "model scores"),
+    ("against full text.", "in more than one result.", "with original tables.",
+     "from multiple task results."),
+)
+_SAYS_LIST_HEADER = (
+    ("The", "The key", "The final", "My"),
+    ("task IDs", "evidence task IDs", "task IDs with unique numbers"),
+    ("I will cite:", "to include:", "I want to include are:", "for the answer:", "are:"),
+)
+_SAYS_LIST_IS_DONE = (
+    ("Let me write", "Now I will write", "I will now write", "Let me give", "Now let me provide"),
+    ("the final JSON", "the final JSON deliverable", "the final answer", "the final JSON response"),
+    ("now.", "citing these IDs.", "with these IDs and a short summary.", "with a full summary.",
+     "with these IDs and a thorough summary."),
+)
+_EVIDENCE_SOURCES = ("Alpha paper", "Beta blog post", "Alpha paper PDF", "Beta docs")
+_EVIDENCE_PARTS = (
+    "full results tables", "abstract page", "section 4 details", "venue confirmation",
+    "benchmark chart image", "method code", "release notes", "exact quotes", "summary table",
+    "appendix B", "results page", "cost table", "model list", "FAQ page",
+)
+_EVIDENCE_DETAILS = (
+    "{p}% absolute gain, {n} fewer turns",
+    "Tables {n}, {m}, {k}",
+    "headline claim of {p}%",
+    "{p}%, {q}%, {r}% figures",
+    "for {n} models",
+    "through version {n}.{m}",
+    "no numbers in the text",
+    "{p}% on the hard split",
+    "{a} vs {b} comparison",
+    "{a} at {p}% and {b} at {q}%",
+    "{a} set results",
+    "{a}-{n} scores",
+    "exact quotes from page {n}",
+    "dataset size {n}k samples",
+    "cost per run ${n}.{m}",
+    "latency {n}ms median",
+    "ablation over {n} prompts",
+    "{n} of {m} tasks solved",
+    "step count drops {p}%",
+    "error bars of {q}%",
+    "plot axis labels only",
+    "GPU hours {n}{m}",
+    "pass@1 {p}.{n}%",
+    "win rate {p}% over {a}",
+    "released {a} {n}",
+    "authors list and venue",
+    "leaderboard snapshot of {n} entries",
+    "{a} baseline at {q}%",
+)
+_NAME_SYLLABLES = (
+    "ka", "lo", "mi", "ter", "va", "sun", "dro", "pel", "qui", "zan", "ro", "bex", "tu", "nor", "fi", "gal",
+)
+
+
+def _made_up_task_ids(rng: random.Random, count: int) -> list[str]:
+    """Made up background task ids."""
+    return [str(uuid.UUID(int=rng.getrandbits(128), version=4)) for _ in range(count)]
+
+
+def _compose_sentence(rng: random.Random, slots: tuple[tuple[str, ...], ...]) -> str:
+    """One sentence made of a random pick from every slot."""
+    return " ".join(rng.choice(words) for words in slots).replace(" .", ".")
+
+
+def _made_up_name(rng: random.Random) -> str:
+    """A made up product or dataset name."""
+    return "".join(rng.choice(_NAME_SYLLABLES) for _ in range(rng.randint(2, 3))).capitalize()
+
+
+def _ways_to_describe_evidence(rng: random.Random, evidence_index: int) -> tuple[str, ...]:
+    """The notes the model may write next to one evidence task in its list."""
+    source = _EVIDENCE_SOURCES[evidence_index % len(_EVIDENCE_SOURCES)]
+    part = _EVIDENCE_PARTS[evidence_index]
+    detail_values = {key: rng.randint(2, 99) for key in "pqrnmk"}
+    detail_values |= {"a": _made_up_name(rng), "b": _made_up_name(rng)}
+    templates = rng.sample(_EVIDENCE_DETAILS, _EVIDENCE_DETAILS_PER_TASK)
+    details = [template.format(**detail_values) for template in templates]
+    detail_suffixes = [""] + [f" ({detail})" for detail in details]
+    neighbour_pairs = zip(details, details[1:])
+    detail_suffixes += [f" ({detail}, {next_detail})" for detail, next_detail in neighbour_pairs]
+    prefixes = ("", f"{source} ", f"{source} ", f"{_made_up_name(rng)} ")
+    return tuple(f"{prefix}{part}{suffix}" for prefix in prefixes for suffix in detail_suffixes)
+
+
+def _task_result_call(rng: random.Random, task_ids: list[str]) -> tuple[str, str]:
+    """A call that reads part of a background task's result."""
+    return "task", json.dumps({
+        "action": "result",
+        "task_id": rng.choice(task_ids),
+        "wait": False,
+        "wait_timeout": None,
+        "offset": rng.choice(_TASK_RESULT_OFFSETS),
+        "max_char": rng.choice(_TASK_RESULT_MAX_CHARS),
+        "tail": None,
+    }, separators=(",", ":"))
+
+
+def _opening_call(rng: random.Random, turn: int, task_ids: list[str]) -> tuple[str, str]:
+    """A call the model makes while it still gathers sources."""
+    name = rng.choices(_OPENING_TOOLS, _OPENING_TOOL_WEIGHTS)[0]
+    topic = f"{rng.choice(_EVIDENCE_SOURCES)} {rng.choice(_EVIDENCE_PARTS)}"
+    if name == "task":
+        return _task_result_call(rng, task_ids)
+    if name == "web_fetch":
+        prompt_length = rng.randint(_FETCH_PROMPT_MIN_SENTENCES, _FETCH_PROMPT_MAX_SENTENCES)
+        return name, json.dumps({
+            "url": f"https://example.com/{topic.replace(' ', '-').lower()}/{turn}",
+            "prompt": " ".join(rng.sample(_OPENING_PLAN_SENTENCES, prompt_length)),
+        })
+    if name == "github":
+        return name, json.dumps({
+            "action": "search_code", "repo": "example/agent-bench", "query": f"{topic} benchmark",
+            "number": None, "path": None, "ref": None, "limit": 10, "state": None,
+        })
+    return name, json.dumps({"query": f"{topic} benchmark results", "freshness": "year"})
+
+
+def _ends_with_a_repeat(items: list) -> bool:
+    """Whether the last few items repeat the few items right before them."""
+    return any(items[-2 * n : -n] == items[-n:] for n in range(1, len(items) // 2 + 1))
+
+
+def _add_call_without_repeat(
+    calls_so_far: list[tuple[str, str]], make_call: Callable[[], tuple[str, str]]
+) -> tuple[str, str]:
+    """Make a call that does not leave the run's calls ending with a repeat, and add it to them."""
+    call = make_call()
+    while _ends_with_a_repeat(calls_so_far + [call]):
+        call = make_call()
+    calls_so_far.append(call)
+    return call
+
+
+def _long_plan(rng: random.Random) -> str:
+    """A long plan that never repeats itself back to back."""
+    sentences: list[str] = []
+    while len(sentences) < _OPENING_LONG_TURN_SENTENCES:
+        sentences.append(rng.choice(_LONG_PLAN_SENTENCES))
+        if _ends_with_a_repeat(sentences):
+            sentences.pop()
+    return " ".join(sentences)
+
+
+def _opening_reasoning(rng: random.Random, turn: int) -> str:
+    """A short note, or on one turn a long plan, written while gathering sources."""
+    if turn == _OPENING_LONG_TURN:
+        return _long_plan(rng)
+    count = rng.choice(_OPENING_SENTENCE_COUNTS)
+    if count == 1:
+        return rng.choice(_OPENING_SHORT_SENTENCES)
+    return " ".join(rng.sample(_OPENING_PLAN_SENTENCES, min(count, len(_OPENING_PLAN_SENTENCES))))
+
+
+def _plan_to_finish(rng: random.Random, has_version_note: bool) -> str:
+    """A few sentences saying the data is in and the final answer comes next."""
+    sentences = [
+        _compose_sentence(rng, _SAYS_DATA_IS_IN),
+        _compose_sentence(rng, _SAYS_ANSWER_COMES_NEXT),
+    ]
+    if rng.random() < _SAYS_WHICH_IDS_TO_CITE_CHANCE:
+        sentences.append(_compose_sentence(rng, _SAYS_WHICH_IDS_TO_CITE))
+    if rng.random() < _SAYS_NUMBERS_WERE_CHECKED_CHANCE:
+        sentences.insert(1, _compose_sentence(rng, _SAYS_NUMBERS_WERE_CHECKED))
+    if has_version_note:
+        sentences.append(f"The numbers moved from version {rng.randint(1, 9)} → {rng.randint(10, 19)}.")
+    return " ".join(sentences)
+
+
+class _EvidenceList:
+    """The numbered evidence list the model rewrites, nearly the same, every closing turn."""
+
+    def __init__(self, rng: random.Random, task_ids: list[str]) -> None:
+        self._rng = rng
+        self._task_ids = task_ids
+        self._ways_to_describe = [_ways_to_describe_evidence(rng, i) for i in range(len(task_ids))]
+        self._listed_tasks = list(range(_LISTED_EVIDENCE_TASKS))
+        self._note_for_task = {task: notes[0] for task, notes in enumerate(self._ways_to_describe)}
+
+    def next_version(self) -> str:
+        """The next version of the list, as numbered lines."""
+        rng = self._rng
+        if rng.random() >= _SAME_LIST_ORDER_CHANCE:
+            listed = list(range(_LISTED_EVIDENCE_TASKS))
+            if rng.random() < _DROP_LATE_ENTRY_CHANCE:
+                listed.pop(rng.randrange(_LISTED_EVIDENCE_TASKS - _LATE_ENTRIES, _LISTED_EVIDENCE_TASKS))
+            if rng.random() < _SWAP_NEIGHBOURS_CHANCE:
+                i = rng.randrange(len(listed) - 1)
+                listed[i], listed[i + 1] = listed[i + 1], listed[i]
+            if rng.random() < _ADD_UNLISTED_TASK_CHANCE:
+                listed.append(_EVIDENCE_TASKS - 1)
+            self._listed_tasks = listed
+        lines = []
+        for number, task in enumerate(self._listed_tasks, 1):
+            if rng.random() >= _SAME_NOTE_CHANCE:
+                self._note_for_task[task] = rng.choice(self._ways_to_describe[task])
+            lines.append(f"{number}. `{self._task_ids[task]}` - {self._note_for_task[task]}")
+        return "\n".join(lines)
+
+
+def _closing_reasoning(rng: random.Random, evidence: _EvidenceList, has_version_note: bool) -> str:
+    """A plan to finish, usually with the evidence list the answer will cite."""
+    plan = _plan_to_finish(rng, has_version_note)
+    if rng.random() < _CLOSING_TURN_WITHOUT_LIST_CHANCE:
+        return plan
+    list_end = _compose_sentence(rng, _SAYS_LIST_IS_DONE)
+    if rng.random() < _TWO_LINE_LIST_END_CHANCE:
+        list_end = f"{_compose_sentence(rng, _SAYS_DATA_IS_IN)}\n{list_end}"
+    header = _compose_sentence(rng, _SAYS_LIST_HEADER)
+    return f"{plan}\n\n{header}\n{evidence.next_version()}\n\n{list_end}"
+
+
+def _turn_messages(reasoning: str, calls: list[tuple[str, str]], first_call_number: int) -> list[dict]:
+    """The assistant message that thinks and makes the calls, then one tool result per call."""
+    tool_calls = [
+        {
+            "id": f"call_{number:024x}",
+            "type": "function",
+            "function": {"name": name, "arguments": arguments},
+        }
+        for number, (name, arguments) in enumerate(calls, first_call_number)
+    ]
+    results = [_tool_result(f"Result of {call['function']['name']}.", call["id"]) for call in tool_calls]
+    return [{"role": "assistant", "reasoning_content": reasoning, "tool_calls": tool_calls}, *results]
+
+
+def _long_agent_run_messages() -> list[dict]:
+    """The history of a long made up agent run that keeps re-reading its task results.
+
+    Returns:
+        A system and a user message, then assistant tool call turns, each
+        followed by one tool result per call.
+    """
+    rng = random.Random(_LONG_RUN_SEED)
+    evidence_ids = _made_up_task_ids(rng, _EVIDENCE_TASKS)
+    all_ids = evidence_ids + _made_up_task_ids(rng, _OPENING_ONLY_TASKS)
+    evidence = _EvidenceList(rng, evidence_ids)
+    messages: list[dict] = [
+        {"role": "system", "content": "You are a research agent. Use the tools to answer."},
+        _user_message("Compare the published benchmark numbers of two agent frameworks."),
+    ]
+    calls_so_far: list[tuple[str, str]] = []
+    for turn in range(_OPENING_TURNS):
+        reasoning = _opening_reasoning(rng, turn)
+        first_call_number = len(calls_so_far) + 1
+        is_one_call_turn = (turn + 1) % _OPENING_TURNS_PER_ONE_CALL_TURN == 0
+        calls = []
+        for _ in range(1 if is_one_call_turn else 2):
+            call = _add_call_without_repeat(calls_so_far, lambda: _opening_call(rng, turn, all_ids))
+            calls.append(call)
+        messages += _turn_messages(reasoning, calls, first_call_number)
+    for closing_turn in range(_CLOSING_TURNS):
+        reasoning = _closing_reasoning(rng, evidence, closing_turn in _VERSION_NOTE_TURNS)
+        first_call_number = len(calls_so_far) + 1
+        call = _add_call_without_repeat(calls_so_far, lambda: _task_result_call(rng, evidence_ids))
+        messages += _turn_messages(reasoning, [call], first_call_number)
+    return messages
+
+
+def _answer_in_child(body: bytes, conn: Connection) -> None:
+    """Answer one request through a production like guard rail and send back how long it took.
+
+    Args:
+        body: The request the client sends.
+        conn: Where to say the guard rail is set up, then send the seconds the
+            answer took and how many times the upstream was called.
+    """
+    plugin = OpenAIGuardRail(_PRODUCTION_GUARD_CONFIG)
+    upstream = _Upstream(_final_answer_reply())
+    client = _make_client_response()
+    conn.send("ready")
+    start = time.perf_counter()
+    written = asyncio.run(_drive(plugin, upstream.forward, client, body))
+    elapsed = time.perf_counter() - start
+    assert extract_sse_field(written) == "final_answer"
+    assert parse_sse_payloads(written)[-1]["choices"][0]["finish_reason"] == "stop"
+    conn.send((elapsed, upstream.calls))
+
+
+class TestLongHistoryLatency:
+    def test_long_agent_run_is_answered_within_budget(self) -> None:
+        """Answer a long history of task polls within one second."""
+        messages = _long_agent_run_messages()
+        body = _request(messages)
+        call_count = sum(len(m.get("tool_calls") or []) for m in messages)
+        reasoning_chars = sum(len(m.get("reasoning_content") or "") for m in messages)
+        size = (
+            f"{len(messages)} messages, {call_count} tool calls, "
+            f"{reasoning_chars} reasoning chars, {len(body)} request bytes"
+        )
+        context = multiprocessing.get_context("spawn")
+        reader, writer = context.Pipe(duplex=False)
+        child = context.Process(target=_answer_in_child, args=(body, writer), daemon=True)
+        child.start()
+        writer.close()
+        try:
+            assert reader.poll(_CHILD_START_TIMEOUT_S), "the child process never got ready"
+            assert reader.recv() == "ready"
+            is_answered = reader.poll(_ANSWER_BUDGET_S)
+            assert is_answered, (
+                f"the guard rail took over {_ANSWER_BUDGET_S}s to answer a request "
+                f"with {size}, so it was killed"
+            )
+            elapsed, upstream_calls = reader.recv()
+        finally:
+            child.kill()
+            child.join()
+        assert upstream_calls == 1
+        assert elapsed <= _ANSWER_BUDGET_S, f"the guard rail took {elapsed:.2f}s on a request with {size}"
