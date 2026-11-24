@@ -11,8 +11,10 @@ from tiktoken import get_encoding
 
 from app.config import ServiceConfig
 from app.plugins.base import PluginBase
-from app.plugins.openai_dialect import ChatCompletionsDialect, CompletionsDialect, OpenAIDialect, find_by_prefix
-from app.plugins.openai_responses_dialect import ResponsesDialect
+from app.plugins.openai_api_formats.base import OpenAIAPIFormat, find_api_format_by_path_prefix
+from app.plugins.openai_api_formats.chat_completions import ChatCompletionsAPIFormat
+from app.plugins.openai_api_formats.legacy_completions import LegacyCompletionsAPIFormat
+from app.plugins.openai_api_formats.responses import ResponsesAPIFormat
 from app.plugins.utils import SSEByteDecoder
 from app.plugins.utils import decode_json_object
 from collections import deque
@@ -23,11 +25,15 @@ __all__ = ["OpenAITokenStats"]
 
 _PREFILLING = 0
 _GENERATING = 1
-_DIALECTS: tuple[OpenAIDialect, ...] = (ChatCompletionsDialect(), CompletionsDialect(), ResponsesDialect())
+_API_FORMATS: tuple[OpenAIAPIFormat, ...] = (
+    ChatCompletionsAPIFormat(),
+    LegacyCompletionsAPIFormat(),
+    ResponsesAPIFormat(),
+)
 
 
 class _RequestState:
-    def __init__(self, dialect: OpenAIDialect) -> None:
+    def __init__(self, api_format: OpenAIAPIFormat) -> None:
         self.state: int = _PREFILLING
         self.state_change_timestamp: float = 0.0
         self.is_stream: bool = False
@@ -35,7 +41,7 @@ class _RequestState:
         self.sse_events: list[dict] = []
         self.decoder: SSEByteDecoder = SSEByteDecoder()
         self.request_toks: int = 0
-        self.dialect: OpenAIDialect = dialect
+        self.api_format: OpenAIAPIFormat = api_format
 
 
 class OpenAITokenStats(PluginBase):
@@ -90,8 +96,8 @@ class OpenAITokenStats(PluginBase):
     ) -> tuple[dict[str, str], bytes, str]:
         headers, body, path = await super().on_request(request_id, headers, body, path)
 
-        dialect = find_by_prefix(_DIALECTS, path)
-        if dialect is None:
+        api_format = find_api_format_by_path_prefix(_API_FORMATS, path)
+        if api_format is None:
             return headers, body, path
 
         if not body:
@@ -101,18 +107,18 @@ class OpenAITokenStats(PluginBase):
         if parsed is None:
             return headers, body, path
 
-        state = _RequestState(dialect)
+        state = _RequestState(api_format)
         state.is_stream = parsed.get("stream", False)
         state.state_change_timestamp = time.time()
         try:
-            state.request_toks = self._count_tokens(dialect.prompt_text(parsed))
+            state.request_toks = self._count_tokens(api_format.extract_prompt_text(parsed))
         except Exception as e:
             _logger.error("Failed to count request tokens: %s", e)
             state.request_toks = 0
         self._requests[request_id] = state
         self._publish_stats()
 
-        dialect.force_stream(parsed)
+        api_format.enable_streaming(parsed)
         new_body = json.dumps(parsed, ensure_ascii=False).encode("utf-8")
         headers["Content-Length"] = str(len(new_body))
         return headers, new_body, path
@@ -131,12 +137,12 @@ class OpenAITokenStats(PluginBase):
             headers["Content-Type"] = "application/json"
         return headers
 
-    def _extract_usage(self, dialect: OpenAIDialect, parsed_json: dict) -> None:
-        usage = dialect.usage(parsed_json)
+    def _extract_usage(self, api_format: OpenAIAPIFormat, parsed_json: dict) -> None:
+        usage = api_format.extract_token_usage(parsed_json)
         if usage is not None:
-            self._input_tokens += usage.input
-            self._output_tokens += usage.output
-            self._total_tokens += usage.total
+            self._input_tokens += usage.input_tokens
+            self._output_tokens += usage.output_tokens
+            self._total_tokens += usage.total_tokens
             self._publish_stats()
     
     def _update_gen_tps(self) -> None:
@@ -254,7 +260,7 @@ class OpenAITokenStats(PluginBase):
         chunk = await super().on_response_chunk(
             request_id, response_headers, chunk, path, status_code, is_final
         )
-        if find_by_prefix(_DIALECTS, path) is None:
+        if find_api_format_by_path_prefix(_API_FORMATS, path) is None:
             return chunk
 
         state: _RequestState | None = self._requests.get(request_id)
@@ -271,10 +277,10 @@ class OpenAITokenStats(PluginBase):
             try:
                 parsed_json = json.loads(data)
                 state.sse_events.append(parsed_json)
-                for generated_text in state.dialect.generated_texts(parsed_json):
+                for generated_text in state.api_format.extract_generated_texts(parsed_json):
                     self._gen_tps_chars += generated_text
                     has_delta = len(generated_text) > 0
-                self._extract_usage(state.dialect, parsed_json)
+                self._extract_usage(state.api_format, parsed_json)
             except json.JSONDecodeError:
                 continue
         
@@ -297,7 +303,7 @@ class OpenAITokenStats(PluginBase):
         if state.is_stream:
             return chunk
         else:
-            result = state.dialect.assemble_non_streaming(state.sse_events)
+            result = state.api_format.assemble_non_streaming_response(state.sse_events)
             if result is not None:
                 return result
             return bytes(state.buffer)

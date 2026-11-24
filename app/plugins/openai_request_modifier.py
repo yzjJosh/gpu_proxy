@@ -5,7 +5,7 @@ import json
 
 from app.config import ServiceConfig
 from app.plugins.base import PluginBase
-from app.plugins.openai_dialect import TranslatedOverrides, find_prefix
+from app.plugins.openai_api_formats.base import RequestOverrides, find_matching_path_prefix
 
 __all__ = ["OpenAIRequestModifier"]
 
@@ -79,10 +79,10 @@ class OpenAIRequestModifier(PluginBase):
     ) -> None:
         super().__init__(config, service_config)
         self.overrides = copy.deepcopy(config.get("overrides", {}))
-        self._translated = self.overrides_by_path(self.overrides)
+        self._overrides_by_path = self.overrides_by_path(self.overrides)
 
-    def overrides_by_path(self, overrides: dict) -> dict[str, TranslatedOverrides]:
-        """Give the overrides to apply on each target path.
+    def overrides_by_path(self, overrides: dict) -> dict[str, RequestOverrides]:
+        """Return the request overrides to apply on each target path.
 
         Args:
             overrides: The configured overrides.
@@ -90,7 +90,7 @@ class OpenAIRequestModifier(PluginBase):
         Returns:
             The overrides for each target path.
         """
-        return {target: TranslatedOverrides(overrides, {}) for target in self.target_paths}
+        return {target: RequestOverrides(overrides, {}) for target in self.target_paths}
 
     async def on_request(
         self, request_id: int, headers: dict[str, str], body: bytes, path: str
@@ -108,8 +108,8 @@ class OpenAIRequestModifier(PluginBase):
             JSON, not a dict, or path does not match target_paths.
         """
         headers, body, path = await super().on_request(request_id, headers, body, path)
-        target = find_prefix(self.target_paths, path)
-        if target is None:
+        matching_path = find_matching_path_prefix(self.target_paths, path)
+        if matching_path is None:
             return headers, body, path
 
         if not self.overrides:
@@ -123,10 +123,14 @@ class OpenAIRequestModifier(PluginBase):
         if not isinstance(parsed, dict):
             return headers, body, path
 
-        translated = self._translated[target]
-        yielding = {key: value for key, value in translated.yielding.items() if key not in parsed}
-        overrides = {**translated.forced, **yielding}
-        # The request already sets every override that yields to it.
+        prepared_overrides = self._overrides_by_path[matching_path]
+        missing_defaults = {
+            key: value
+            for key, value in prepared_overrides.apply_if_missing.items()
+            if key not in parsed
+        }
+        overrides = {**prepared_overrides.always_apply, **missing_defaults}
+        # The request already sets every conditional default override.
         if not overrides:
             return headers, body, path
 

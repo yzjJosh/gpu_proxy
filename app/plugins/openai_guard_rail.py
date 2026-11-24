@@ -13,14 +13,14 @@ from app.responses import AbstractMutatingResponse, CaptureResponse
 import aiohttp.web as web
 
 from app.plugins.base import PluginBase
-from app.plugins.openai_dialect import (
-    ChatCompletionsDialect,
-    ChatProjection,
-    ConversationDialect,
-    canonicalize_arguments,
-    find_exact,
+from app.plugins.openai_api_formats.base import (
+    ConversationAPIFormat,
+    EditableMessageHistory,
+    find_api_format_by_exact_path,
+    standardize_json_arguments,
 )
-from app.plugins.openai_responses_dialect import ResponsesDialect
+from app.plugins.openai_api_formats.chat_completions import ChatCompletionsAPIFormat
+from app.plugins.openai_api_formats.responses import ResponsesAPIFormat
 from app.plugins.utils import (
     SSEByteDecoder,
     ToolCallExclusion,
@@ -33,8 +33,8 @@ _FINGERPRINT_MODULUS = (1 << 61) - 1
 _FINGERPRINT_BASE = 1_000_003
 _RESUMPTION_LRU_SIZE = 50
 
-_CHAT_DIALECT = ChatCompletionsDialect()
-_DIALECTS: tuple[ConversationDialect, ...] = (_CHAT_DIALECT, ResponsesDialect())
+_CHAT_API_FORMAT = ChatCompletionsAPIFormat()
+_API_FORMATS: tuple[ConversationAPIFormat, ...] = (_CHAT_API_FORMAT, ResponsesAPIFormat())
 
 __all__ = ["OpenAIGuardRail"]
 
@@ -492,25 +492,25 @@ def _encode_request_body(
     return modified_headers, modified_body
 
 
-def _decode_request_projection(
-    body: bytes, dialect: ConversationDialect
-) -> tuple[dict, ChatProjection] | None:
-    """Parse a request body and its chat messages, or None if it has none."""
+def _decode_editable_message_history(
+    body: bytes, api_format: ConversationAPIFormat
+) -> tuple[dict, EditableMessageHistory] | None:
+    """Parse a request body and its editable message history, or None if absent."""
     data = _decode_request_body(body)
     if data is None:
         return None
-    projection = dialect.project(data)
-    if projection is None:
+    message_history = api_format.extract_message_history(data)
+    if message_history is None:
         return None
-    return data, projection
+    return data, message_history
 
 
-def _read_request_history[V](data: dict[str, V], dialect: ConversationDialect) -> list | V | None:
-    """Read the history a request carries, as chat messages when it has a usable one."""
-    projection = dialect.project(data)
-    if projection is not None:
-        return projection.messages
-    return dialect.history_value(data)
+def _read_request_history[V](data: dict[str, V], api_format: ConversationAPIFormat) -> list | V | None:
+    """Read the message history a request carries, as chat messages when usable."""
+    message_history = api_format.extract_message_history(data)
+    if message_history is not None:
+        return message_history.messages
+    return api_format.get_raw_history_field(data)
 
 
 def _safe_suffix_start(text: str, min_block_size: int, chunk_size: int) -> int:
@@ -689,14 +689,14 @@ class _Session:
         validate_tool_calls: bool,
         response: AbstractMutatingResponse,
         web_request: web.Request,
-        dialect: ConversationDialect,
+        api_format: ConversationAPIFormat,
         messages: list[dict] | None = None,
         resumption_state: _ResumptionState | None = None,
         dedup_exclusions: list[ToolCallExclusion] | None = None,
     ) -> None:
         self.is_stream = is_stream
-        self.dialect = dialect
-        self._splicer = dialect.output_splicer()
+        self.api_format = api_format
+        self._retry_stream_combiner = api_format.create_retry_stream_combiner()
         self.max_retries = max_retries
         self.break_loops = break_loops
         self.min_loop_distance = min_loop_distance
@@ -746,7 +746,7 @@ class _Session:
                 for tc in m.get("tool_calls") or []:
                     func = tc.get("function") or {}
                     name = func.get("name") or ""
-                    args = canonicalize_arguments(func.get("arguments") or "")
+                    args = standardize_json_arguments(func.get("arguments") or "")
                     tc_text = name + args
                     tc_id = tc.get("id") or ""
                     if tc_text:
@@ -924,11 +924,11 @@ class _Session:
         self._approve(raw_bytes)
 
     def _approve(self, raw_bytes: bytes) -> None:
-        self.approved_buffer.extend(self._splicer.splice(raw_bytes))
+        self.approved_buffer.extend(self._retry_stream_combiner.feed_approved_bytes(raw_bytes))
 
     def on_retry(self) -> None:
         """Mark that the current attempt is being retried."""
-        self._splicer.retry()
+        self._retry_stream_combiner.begin_retry()
 
     async def on_prepared(
         self, status_code: int, reason: str, hdrs: dict[str, str]
@@ -951,13 +951,13 @@ class _Session:
         await self.response.prepare(self.web_request)
 
     async def on_delta(
-        self, deltas: list[dict], carrier: int | None, raw_bytes: bytes
+        self, updates: list[dict], raw_bytes_owner_index: int | None, raw_bytes: bytes
     ) -> None:
-        """Check the pieces of one stream event and send what is approved.
+        """Check the updates of one stream event and send what is approved.
 
         Args:
-            deltas: The pieces of the event, in the order they are checked.
-            carrier: The index of the piece that carries the event's bytes.
+            updates: The updates of the event, in validation order.
+            raw_bytes_owner_index: The index of the update that carries the event's bytes.
             raw_bytes: The event's bytes.
         """
         if not self.prepared:
@@ -966,12 +966,12 @@ class _Session:
         if not self.is_ok:
             # Pass through error message.
             self._approve(raw_bytes)
-        elif not deltas:
+        elif not updates:
             # Go through serializer for processing in-place.
             self._delta_serializer.feed({}, raw_bytes)
         else:
-            for index, delta in enumerate(deltas):
-                self._delta_serializer.feed(delta, raw_bytes if index == carrier else b"")
+            for index, update in enumerate(updates):
+                self._delta_serializer.feed(update, raw_bytes if index == raw_bytes_owner_index else b"")
 
         # Immediately approved buffer in stream mode
         if self.is_stream:
@@ -988,7 +988,7 @@ class _Session:
         """Flush remaining approved buffer to the response and close."""
         if not self.prepared:
             return
-        self.approved_buffer.extend(self._splicer.finish())
+        self.approved_buffer.extend(self._retry_stream_combiner.flush_closing_events())
         if self.approved_buffer:
             approved_bytes = bytes(self.approved_buffer)
             if self.is_stream:
@@ -1030,7 +1030,7 @@ class _Session:
             "[OpenAIGuardRail] Assembling non-streaming response from %d events",
             len(events),
         )
-        return self.dialect.assemble_non_streaming(events)
+        return self.api_format.assemble_non_streaming_response(events)
 
 
 # The plugin manager loads this module with spec.loader.exec_module and finds the
@@ -1200,11 +1200,11 @@ class OpenAIGuardRail(PluginBase):
         Returns:
             List of path strings that trigger interception.
         """
-        return [dialect.path for dialect in _DIALECTS]
+        return [api_format.endpoint_path for api_format in _API_FORMATS]
 
-    def _pick_dialect(self, path: str) -> ConversationDialect:
+    def _select_api_format(self, path: str) -> ConversationAPIFormat:
         """Pick the API format of an intercepted path, chat unless it is another known one."""
-        return find_exact(_DIALECTS, urlparse(path).path) or _CHAT_DIALECT
+        return find_api_format_by_exact_path(_API_FORMATS, urlparse(path).path) or _CHAT_API_FORMAT
 
     def _is_streaming_request(self, body: bytes) -> bool:
         """Check if the original request asked for streaming."""
@@ -1214,13 +1214,13 @@ class OpenAIGuardRail(PluginBase):
             return False
 
     def _force_stream(
-        self, headers: dict[str, str], body: bytes, dialect: ConversationDialect
+        self, headers: dict[str, str], body: bytes, api_format: ConversationAPIFormat
     ) -> tuple[dict[str, str], bytes]:
         """Ask the upstream to stream its reply."""
         data = _decode_request_body(body)
         if data is None:
             return headers, body
-        dialect.force_stream(data)
+        api_format.enable_streaming(data)
         return _encode_request_body(headers, data)
 
     def _append_msg(
@@ -1228,15 +1228,15 @@ class OpenAIGuardRail(PluginBase):
         headers: dict[str, str],
         body: bytes,
         messages: list[dict],
-        dialect: ConversationDialect,
+        api_format: ConversationAPIFormat,
     ) -> tuple[dict[str, str], bytes]:
         """Append messages to request body for retry."""
-        decoded = _decode_request_projection(body, dialect)
+        decoded = _decode_editable_message_history(body, api_format)
         if decoded is None:
             return headers, body
-        data, projection = decoded
-        projection.messages.extend(messages)
-        projection.write_back()
+        data, message_history = decoded
+        message_history.messages.extend(messages)
+        message_history.apply_to_request()
         return _encode_request_body(headers, data)
 
     def _resume_states(
@@ -1244,16 +1244,16 @@ class OpenAIGuardRail(PluginBase):
         headers: dict[str, str],
         body: bytes,
         resumption_state: _ResumptionState | None,
-        dialect: ConversationDialect,
+        api_format: ConversationAPIFormat,
     ) -> tuple[dict[str, str], bytes]:
         """Recover reasoning and insert missing assistant messages from resumption state."""
         if not resumption_state or not resumption_state.messages:
             return headers, body
-        decoded = _decode_request_projection(body, dialect)
+        decoded = _decode_editable_message_history(body, api_format)
         if decoded is None:
             return headers, body
-        data, projection = decoded
-        msgs = projection.messages
+        data, message_history = decoded
+        msgs = message_history.messages
         _logger.debug(
             "[OpenAIGuardRail] _resume_states: %d msgs in request, %d saved messages in resumption state",
             len(msgs),
@@ -1334,7 +1334,7 @@ class OpenAIGuardRail(PluginBase):
                     j -= 1
         if not resumed:
             return headers, body
-        projection.write_back()
+        message_history.apply_to_request()
         return _encode_request_body(headers, data)
 
     async def handle_overridden_request(
@@ -1365,11 +1365,11 @@ class OpenAIGuardRail(PluginBase):
             True if upstream returned 200, False otherwise.
         """
         _logger.debug("[OpenAIGuardRail] Intercepting %s", path)
-        dialect = self._pick_dialect(path)
+        api_format = self._select_api_format(path)
         is_streaming = self._is_streaming_request(body)
-        resumption_state = self._pop_resumption_state(_read_request_history(json.loads(body), dialect))
-        headers, body = self._resume_states(headers, body, resumption_state, dialect)
-        headers, body = self._force_stream(headers, body, dialect)
+        resumption_state = self._pop_resumption_state(_read_request_history(json.loads(body), api_format))
+        headers, body = self._resume_states(headers, body, resumption_state, api_format)
+        headers, body = self._force_stream(headers, body, api_format)
 
         session = _Session(
             is_streaming,
@@ -1381,8 +1381,8 @@ class OpenAIGuardRail(PluginBase):
             self.config.get("validate_tool_calls", False),
             response,
             web_request,
-            dialect,
-            _read_request_history(json.loads(body), dialect),
+            api_format,
+            _read_request_history(json.loads(body), api_format),
             resumption_state,
             self._dedup_exclusions,
         )
@@ -1421,7 +1421,7 @@ class OpenAIGuardRail(PluginBase):
                         session.resumption_state().messages[-1],
                         {"role": "system", "content": e.message},
                     ],
-                    dialect,
+                    api_format,
                 )
         await session.flush()
         if session.is_ok:
@@ -1480,16 +1480,18 @@ class OpenAIGuardRail(PluginBase):
 
             forward_task.add_done_callback(_on_forward_done)
 
-            decoder = session.dialect.delta_decoder()
+            event_parser = session.api_format.create_stream_event_parser()
             async for parsed_json, raw_bytes in _iter_openai_sse_events(
                 capture.iter_chunks()
             ):
                 event_count += 1
-                deltas: list[dict] = []
-                carrier: int | None = None
+                updates: list[dict] = []
+                raw_bytes_owner_index: int | None = None
                 if is_ok and parsed_json:
-                    deltas, carrier = decoder.normalize(parsed_json)
-                await session.on_delta(deltas, carrier, raw_bytes)
+                    parsed_event = event_parser.parse_event(parsed_json)
+                    updates = parsed_event.updates
+                    raw_bytes_owner_index = parsed_event.raw_bytes_owner_index
+                await session.on_delta(updates, raw_bytes_owner_index, raw_bytes)
             await session.on_finish()
             _logger.debug("[OpenAIGuardRail] Relay complete, events=%s", event_count)
 

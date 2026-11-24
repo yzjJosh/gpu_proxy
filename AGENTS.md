@@ -28,9 +28,11 @@ Bundled plugins:
 - `OpenAIGuardRail` — intercepts `/v1/chat/completions` and `/v1/responses`, forces streaming, detects repetition loops / duplicate + invalid tool calls / missing final output, and retries the model
 - `OpenAITokenStats` — real-time token counts and tokens-per-second (prefill + generate) telemetry
 
-The four OpenAI plugins read and write the wire format through per-API dialects, so chat completions, legacy completions and the Responses API get the same work:
-- `openai_dialect.py` — the `OpenAIDialect` / `ConversationDialect` contracts and the chat and legacy completions dialects
-- `openai_responses_dialect.py` — `ResponsesDialect`: the Responses input projection and write-back, stream decoder, retry splicer and reply assembly
+The four OpenAI plugins read and write the wire format through per-API format adapters in `app/plugins/openai_api_formats/`, so chat completions, legacy completions, and the Responses API share the same logic:
+- `openai_api_formats/base.py` — `OpenAIAPIFormat`, `ConversationAPIFormat`, `ChoicesBasedAPIFormat`, shared data types, and path lookup helpers
+- `openai_api_formats/chat_completions.py` — `ChatCompletionsAPIFormat`
+- `openai_api_formats/legacy_completions.py` — `LegacyCompletionsAPIFormat`
+- `openai_api_formats/responses.py` — `ResponsesAPIFormat`: Responses message history editing, stream event parsing, multi-attempt retry stream combining, and non-streaming response assembly
 
 **Configuration:** `config.yaml` at the repo root (template: `config.example.yaml`). Each service declares a `priority`, `vram_budget`, `hostname` (the demux key), `target` URL, optional `backup` URL, `gpu_routes`, and optional `health_check_command` / `is_persistent`. `total_vram_budget` and `listen_port` are set at the top level.
 

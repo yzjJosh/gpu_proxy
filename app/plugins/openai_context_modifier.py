@@ -9,8 +9,8 @@ from typing import Callable
 import tiktoken
 from app.config import ServiceConfig
 from app.plugins.base import PluginBase
-from app.plugins.openai_dialect import ChatCompletionsDialect, ConversationDialect, find_exact
-from app.plugins.openai_responses_dialect import ResponsesDialect
+from app.plugins.openai_api_formats import chat_completions, responses
+from app.plugins.openai_api_formats.base import ConversationAPIFormat, find_api_format_by_exact_path
 from app.plugins.utils import (
     ToolCallExclusion,
     decode_json_object,
@@ -30,7 +30,7 @@ def _count_tokens(text: str) -> int:
     return len(_tiktoken_encoder.encode(text, allowed_special="all"))
 
 
-_DIALECTS: tuple[ConversationDialect, ...] = (ChatCompletionsDialect(), ResponsesDialect())
+_API_FORMATS: tuple[ConversationAPIFormat, ...] = (chat_completions.ChatCompletionsAPIFormat(), responses.ResponsesAPIFormat())
 _TOOL_RESULT_PLACEHOLDER = "[tool result pruned]"
 _TRUNCATE_ARGS_AT = 100
 _TRUNCATE_ARGS_PLACEHOLDER = "..."
@@ -192,8 +192,8 @@ class OpenAIContextModifier(PluginBase):
         self, request_id: int, headers: dict[str, str], body: bytes, path: str
     ) -> tuple[dict[str, str], bytes, str]:
         headers, body, path = await super().on_request(request_id, headers, body, path)
-        dialect = find_exact(_DIALECTS, path)
-        if dialect is None:
+        api_format = find_api_format_by_exact_path(_API_FORMATS, path)
+        if api_format is None:
             return headers, body, path
 
         if (
@@ -208,10 +208,10 @@ class OpenAIContextModifier(PluginBase):
         if parsed is None:
             return headers, body, path
 
-        projection = dialect.project(parsed)
-        if projection is None:
+        message_history = api_format.extract_message_history(parsed)
+        if message_history is None:
             return headers, body, path
-        messages = projection.messages
+        messages = message_history.messages
 
         conv_id = _conversation_id(messages)
         state: _ConversationState | None = None
@@ -253,7 +253,7 @@ class OpenAIContextModifier(PluginBase):
                 self._repeat_max_window_ratio,
                 state,
             )
-        projection.write_back()
+        message_history.apply_to_request()
         new_body = json.dumps(parsed, ensure_ascii=False).encode("utf-8")
         headers["Content-Length"] = str(len(new_body))
         try:
