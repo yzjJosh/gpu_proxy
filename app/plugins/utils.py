@@ -14,48 +14,80 @@ __all__ = [
 ]
 
 
+_BASE_EXCLUSION_KEYS: frozenset[str] = frozenset({"tool_name_regex", "tool_args_regex"})
+
+
 @dataclass
 class ToolCallExclusion:
     """A compiled tool call exclusion entry.
 
-    Both patterns may be present; a tool call is excluded only when every
+    Both patterns may be present. A tool call matches only when every
     pattern that is set matches.
     """
 
     name_re: re.Pattern[str] | None
     args_re: re.Pattern[str] | None
 
+    def matches(self, name: str, args: str) -> bool:
+        """Tell whether a tool call matches this entry.
+
+        Args:
+            name: The tool name.
+            args: The tool arguments text.
+
+        Returns:
+            True when every set pattern matches.
+        """
+        if self.name_re is not None and not self.name_re.search(name):
+            return False
+        if self.args_re is not None and not self.args_re.search(args):
+            return False
+        return True
+
 
 def parse_tool_call_exclusions(
-    raw: list, log_prefix: str, config_key: str
+    raw: list,
+    log_prefix: str,
+    config_key: str,
+    *,
+    extra_allowed_keys: frozenset[str] = frozenset(),
 ) -> list[ToolCallExclusion]:
     """Parse a list of exclusion dicts into compiled patterns.
 
     Args:
-        raw: A list of dicts, each with optional ``tool_name_regex`` and
-            ``tool_args_regex``.
-        log_prefix: Prefix identifying the plugin in error messages.
-        config_key: The config key holding these exclusions, named in
-            error messages so a user knows which key to fix.
+        raw: A list of dicts with optional tool_name_regex and
+            tool_args_regex keys.
+        log_prefix: Prefix naming the plugin in error messages.
+        config_key: The config key holding these exclusions.
+        extra_allowed_keys: Additional entry keys accepted for this caller.
 
     Returns:
         The compiled exclusions.
 
     Raises:
-        ConfigError: If ``raw`` is not a list, an entry is not a dict, an entry
-            defines neither pattern, or a pattern is not a valid string regex.
+        ConfigError: If raw is not a list, an entry is not a dict, an entry
+            has an unrecognized key, an entry defines neither pattern, or a
+            pattern is not a valid string regex.
     """
     if not isinstance(raw, list):
         raise ConfigError(
             f"{log_prefix}: {config_key} must be a list, "
             f"got {type(raw)}"
         )
+    allowed_keys = _BASE_EXCLUSION_KEYS | extra_allowed_keys
     exclusions: list[ToolCallExclusion] = []
     for index, entry in enumerate(raw):
         if not isinstance(entry, dict):
             raise ConfigError(
                 f"{log_prefix}: {config_key}[{index}] must be a dict, "
                 f"got {type(entry)}"
+            )
+        unknown_keys = sorted(repr(key) for key in set(entry) - allowed_keys)
+        if unknown_keys:
+            joined = ", ".join(unknown_keys)
+            raise ConfigError(
+                f"{log_prefix}: {config_key}[{index}] has unrecognized "
+                f"key(s): {joined}"
             )
         name_re = _compile_optional(
             entry.get("tool_name_regex"), "tool_name_regex", log_prefix
@@ -73,14 +105,8 @@ def parse_tool_call_exclusions(
 
 
 def is_tool_call_excluded(name: str, args: str, exclusions: list[ToolCallExclusion]) -> bool:
-    """Return True if any exclusion entry matches (every present regex must match)."""
-    for entry in exclusions:
-        if entry.name_re is not None and not entry.name_re.search(name):
-            continue
-        if entry.args_re is not None and not entry.args_re.search(args):
-            continue
-        return True
-    return False
+    """Return True if any exclusion entry matches."""
+    return any(entry.matches(name, args) for entry in exclusions)
 
 
 def _compile_optional(pattern: str | None, field: str, log_prefix: str) -> re.Pattern[str] | None:

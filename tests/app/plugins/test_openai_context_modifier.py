@@ -1493,6 +1493,32 @@ class TestToolCallPruneExclusions:
         with pytest.raises(ConfigError, match="tool_call_prune_exclusions"):
             OpenAIContextModifier(_amortized_config(exclusions=[{"no_pattern": "x"}]))
 
+    @pytest.mark.parametrize(
+        "count_value",
+        [
+            pytest.param(3, id="int"),
+            pytest.param(None, id="none"),
+        ],
+    )
+    async def test_max_dup_exclusion_count_rejected_in_prune_exclusions(
+        self, count_value: int | None
+    ) -> None:
+        """Context modifier rejects max_dup_exclusion_count in tool_call_prune_exclusions."""
+        with pytest.raises(
+            ConfigError,
+            match=r"OpenAIContextModifier: tool_call_prune_exclusions\[0\].*max_dup_exclusion_count",
+        ):
+            OpenAIContextModifier(
+                _amortized_config(
+                    exclusions=[
+                        {
+                            "tool_name_regex": "search",
+                            "max_dup_exclusion_count": count_value,
+                        }
+                    ]
+                )
+            )
+
     async def test_exclusion_does_not_affect_dedup(self) -> None:
         """Exclusions apply to amortized pruning, not dedup. Dedup still works."""
         plugin = OpenAIContextModifier({

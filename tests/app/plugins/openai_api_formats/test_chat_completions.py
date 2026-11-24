@@ -8,7 +8,6 @@ from app.plugins.openai_api_formats.base import (
     ParsedStreamEvent,
     RequestOverrides,
     TokenUsage,
-    standardize_json_arguments,
 )
 from app.plugins.openai_api_formats.chat_completions import ChatCompletionsAPIFormat
 
@@ -85,7 +84,7 @@ def _extract_first_matching_update(stream_event: dict) -> dict:
         for tool_call in delta.get("tool_calls") or []:
             function = tool_call.get("function") or {}
             name = function.get("name") or ""
-            arguments = standardize_json_arguments(function.get("arguments") or "")
+            arguments = function.get("arguments") or ""
             tool_call_id = tool_call.get("id") or ""
             if name + arguments or tool_call_id:
                 return _expected_tool_call_update(name + arguments, tool_call_id, name, arguments)
@@ -306,25 +305,24 @@ class TestChatStreamEventParserRawBytesOwner:
 
 
 class TestChatStreamEventParserToolArguments:
-    """The chat stream parser standardizes valid JSON tool call arguments."""
+    """The chat stream parser keeps raw tool call arguments unchanged."""
 
-    def test_reformats_valid_json_arguments(self) -> None:
-        """Complete JSON tool arguments are reformatted into standard JSON spacing."""
+    @pytest.mark.parametrize(
+        "raw_arguments",
+        [
+            pytest.param('{"a":1,  "b": [2]}', id="complete-json"),
+            pytest.param('{"a":', id="partial-json"),
+        ],
+    )
+    def test_preserves_raw_tool_arguments(self, raw_arguments: str) -> None:
+        """Tool argument strings pass through without per-chunk reformatting."""
         stream_event = _build_chat_stream_chunk(
-            _build_chat_choice({"tool_calls": [_build_tool_call_delta('{"a":1,  "b": [2]}', tool_call_id="c1")]})
+            _build_chat_choice({"tool_calls": [_build_tool_call_delta(raw_arguments, tool_call_id="c1")]})
         )
         parsed = _CHAT_API_FORMAT.create_stream_event_parser().parse_event(stream_event)
         assert parsed.updates == [
-            _expected_tool_call_update('{"a": 1, "b": [2]}', "c1", "", '{"a": 1, "b": [2]}')
+            _expected_tool_call_update(raw_arguments, "c1", "", raw_arguments)
         ]
-
-    def test_preserves_partial_json_arguments(self) -> None:
-        """Partial tool arguments that are not valid JSON stay unchanged."""
-        stream_event = _build_chat_stream_chunk(
-            _build_chat_choice({"tool_calls": [_build_tool_call_delta('{"a":', tool_call_id="c1")]})
-        )
-        parsed = _CHAT_API_FORMAT.create_stream_event_parser().parse_event(stream_event)
-        assert parsed.updates == [_expected_tool_call_update('{"a":', "c1", "", '{"a":')]
 
 
 class TestChatMessageHistoryAndRetryCombiner:

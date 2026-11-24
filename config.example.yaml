@@ -38,6 +38,9 @@ plugins:
       tool_call_dedup_exclusions:
         - tool_name_regex: '(?i)read'
           tool_args_regex: '(?i)skills?\.md'
+        - tool_name_regex: '^task$'
+          tool_args_regex: '"action"\s*:\s*"(result|status)"'
+          max_dup_exclusion_count: 5  # optional int >= 1, omit or set null for unlimited
 
 services:
   llamacpp-server:

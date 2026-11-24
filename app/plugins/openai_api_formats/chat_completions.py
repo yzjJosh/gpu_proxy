@@ -12,7 +12,6 @@ from app.plugins.openai_api_formats.base import (
     build_tool_call_update,
     extract_chat_delta_reasoning,
     extract_chat_tool_call_fields,
-    standardize_json_arguments,
 )
 from app.plugins.utils import assemble_non_streaming_response
 
@@ -35,7 +34,6 @@ def _build_chat_reasoning_update(delta: dict) -> dict | None:
 
 def _build_chat_tool_call_update(tool_call: dict) -> dict | None:
     tool_name, arguments = extract_chat_tool_call_fields(tool_call)
-    arguments = standardize_json_arguments(arguments)
     tool_call_id = tool_call.get("id") or ""
     if not tool_name and not arguments and not tool_call_id:
         return None

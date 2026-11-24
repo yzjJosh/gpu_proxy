@@ -432,3 +432,56 @@ class TestParseToolCallExclusions:
         """An invalid args regex fails early instead of warning and continuing."""
         with pytest.raises(ConfigError, match="not a valid regex"):
             parse_tool_call_exclusions([{"tool_args_regex": "[bad"}], "Test", "tool_call_test_exclusions")
+
+    def test_entry_matches_method_checks_set_patterns(self) -> None:
+        """ToolCallExclusion.matches checks every pattern configured on the entry."""
+        exclusions = parse_tool_call_exclusions(
+            [
+                {"tool_name_regex": "^task$", "tool_args_regex": '"action": "status"'},
+                {"tool_name_regex": "^read$"},
+                {"tool_args_regex": "poll"},
+            ],
+            "Test",
+            "tool_call_test_exclusions",
+        )
+        assert exclusions[0].matches("task", '{"action": "status"}')
+        assert not exclusions[0].matches("task", '{"action": "run"}')
+        assert not exclusions[0].matches("other", '{"action": "status"}')
+        assert exclusions[1].matches("read", "{}")
+        assert not exclusions[1].matches("write", "{}")
+        assert exclusions[2].matches("any", "poll")
+        assert not exclusions[2].matches("any", "run")
+
+    def test_unrecognized_key_rejected_by_default(self) -> None:
+        """Unknown keys fail fast with plugin, config key, index, and key name."""
+        with pytest.raises(
+            ConfigError,
+            match=r"Test: tool_call_test_exclusions\[0\].*unrecognized key.*max_dup_exclusion_count",
+        ):
+            parse_tool_call_exclusions(
+                [{"tool_name_regex": "read", "max_dup_exclusion_count": 3}],
+                "Test",
+                "tool_call_test_exclusions",
+            )
+
+    def test_extra_allowed_keys_accepts_opted_in_key_only(self) -> None:
+        """Opted-in extra keys pass while other unknown keys still raise ConfigError."""
+        exclusions = parse_tool_call_exclusions(
+            [{"tool_name_regex": "read", "max_dup_exclusion_count": 3}],
+            "Test",
+            "tool_call_test_exclusions",
+            extra_allowed_keys=frozenset({"max_dup_exclusion_count"}),
+        )
+        assert len(exclusions) == 1
+        assert exclusions[0].matches("read_file", "{}")
+
+        with pytest.raises(
+            ConfigError,
+            match=r"Test: tool_call_test_exclusions\[0\].*unrecognized key.*typo_key",
+        ):
+            parse_tool_call_exclusions(
+                [{"tool_name_regex": "read", "typo_key": 1}],
+                "Test",
+                "tool_call_test_exclusions",
+                extra_allowed_keys=frozenset({"max_dup_exclusion_count"}),
+            )

@@ -1336,8 +1336,15 @@ class TestStreamEventParserIndividualEvents:
         )
         assert parsed.updates == [{"type": expected_update_type, "text": "abc"}]
 
-    def test_function_call_opening_standardizes_initial_arguments(self) -> None:
-        """Initial JSON arguments on output_item.added are reformatted into standard JSON."""
+    @pytest.mark.parametrize(
+        "raw_arguments",
+        [
+            pytest.param('{"a":1}', id="complete-json"),
+            pytest.param('{"a":', id="partial-json"),
+        ],
+    )
+    def test_function_call_opening_preserves_raw_initial_arguments(self, raw_arguments: str) -> None:
+        """Initial arguments on output_item.added pass through verbatim."""
         payload = {
             "type": "response.output_item.added",
             "item": {
@@ -1345,16 +1352,44 @@ class TestStreamEventParserIndividualEvents:
                 "id": "f",
                 "call_id": "c",
                 "name": "n",
-                "arguments": '{"a":1}',
+                "arguments": raw_arguments,
             },
         }
         parsed = _RESPONSES_API_FORMAT.create_stream_event_parser().parse_event(payload)
         assert parsed.updates == [
             {
                 "type": "tool_call",
-                "text": 'n{"a": 1}',
+                "text": f"n{raw_arguments}",
                 "tool_call_id": "c",
-                "function": {"name": "n", "arguments": '{"a": 1}'},
+                "function": {"name": "n", "arguments": raw_arguments},
+            }
+        ]
+
+    @pytest.mark.parametrize(
+        "raw_delta",
+        [
+            pytest.param('{"a":1}', id="complete-json"),
+            pytest.param('{"a":', id="partial-json"),
+        ],
+    )
+    def test_function_call_arguments_delta_preserves_raw_text(self, raw_delta: str) -> None:
+        """Function call argument deltas pass through verbatim without reformatting."""
+        parser = _RESPONSES_API_FORMAT.create_stream_event_parser()
+        parser.parse_event(
+            {
+                "type": "response.output_item.added",
+                "item": {"type": "function_call", "id": "f", "call_id": "c", "name": "n", "arguments": ""},
+            }
+        )
+        parsed = parser.parse_event(
+            {"type": "response.function_call_arguments.delta", "item_id": "f", "delta": raw_delta}
+        )
+        assert parsed.updates == [
+            {
+                "type": "tool_call",
+                "text": raw_delta,
+                "tool_call_id": "c",
+                "function": {"name": "", "arguments": raw_delta},
             }
         ]
 

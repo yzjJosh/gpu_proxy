@@ -4,10 +4,11 @@ import json
 import logging
 import time
 from collections import OrderedDict, deque
+from dataclasses import dataclass
 from typing import AsyncIterator, Awaitable, Callable, Iterable, Self
 from urllib.parse import urlparse
 
-from app.config import ServiceConfig
+from app.config import ConfigError, ServiceConfig
 from app.responses import AbstractMutatingResponse, CaptureResponse
 
 import aiohttp.web as web
@@ -24,11 +25,11 @@ from app.plugins.openai_api_formats.responses import ResponsesAPIFormat
 from app.plugins.utils import (
     SSEByteDecoder,
     ToolCallExclusion,
-    is_tool_call_excluded,
     parse_tool_call_exclusions,
 )
 
-_TOOL_CALL_LOOP_DETECTOR_MIN_DISTANCE = 5
+_TOOL_CALL_HASH_MIN_LENGTH = 32
+_DEDUP_EXCLUSION_EXTRA_KEYS: frozenset[str] = frozenset({"max_dup_exclusion_count"})
 _FINGERPRINT_MODULUS = (1 << 61) - 1
 _FINGERPRINT_BASE = 1_000_003
 _RESUMPTION_LRU_SIZE = 50
@@ -245,36 +246,159 @@ class _LRUOrderedDict:
         return tc_id in self._id_to_state
 
 
+@dataclass(frozen=True, slots=True)
+class _DedupExclusion:
+    """One compiled duplicate tool call exclusion with an optional repeat cap."""
+
+    pattern: ToolCallExclusion
+    max_dup_exclusion_count: int | None
+
+
+def _parse_max_dup_exclusion_count(entry: dict, index: int) -> int | None:
+    if "max_dup_exclusion_count" not in entry:
+        return None
+    value = entry["max_dup_exclusion_count"]
+    if value is None:
+        return None
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise ConfigError(
+            f"OpenAIGuardRail: tool_call_dedup_exclusions[{index}] "
+            f"max_dup_exclusion_count must be an integer >= 1 or null, "
+            f"got {value!r}"
+        )
+    return value
+
+
+def _parse_dedup_exclusions(raw: list) -> list[_DedupExclusion]:
+    patterns = parse_tool_call_exclusions(
+        raw,
+        "OpenAIGuardRail",
+        "tool_call_dedup_exclusions",
+        extra_allowed_keys=_DEDUP_EXCLUSION_EXTRA_KEYS,
+    )
+    return [
+        _DedupExclusion(pattern, _parse_max_dup_exclusion_count(entry, index))
+        for index, (pattern, entry) in enumerate(zip(patterns, raw))
+    ]
+
+
+def _resolve_dedup_limit(
+    name: str,
+    standardized_arguments: str,
+    exclusions: list[_DedupExclusion],
+) -> int | None:
+    limit: int | None = None
+    matched = False
+    for entry in exclusions:
+        if not entry.pattern.matches(name, standardized_arguments):
+            continue
+        matched = True
+        if entry.max_dup_exclusion_count is None:
+            return None
+        if limit is None or entry.max_dup_exclusion_count > limit:
+            limit = entry.max_dup_exclusion_count
+    return limit if matched else 1
+
+
+@dataclass(frozen=True, slots=True)
+class _ToolCallHash:
+    """Hashed representation of one completed tool call."""
+
+    compact_digest: bytes
+    extended_hash: str
+
+
 class _ToolCallHasher:
-    """Accumulates tool call fragments and produces a SHA-256 hash on ID boundary."""
+    """Compute compact and optional extended hashes for completed tool calls."""
+
+    @classmethod
+    def hash_tool_call(
+        cls,
+        name: str,
+        standardized_arguments: str,
+        *,
+        should_extend_hash: bool,
+    ) -> _ToolCallHash | None:
+        if not name and not standardized_arguments:
+            return None
+        payload = f"{name}\0{standardized_arguments}".encode()
+        compact_digest = hashlib.sha256(payload).digest()
+        if not should_extend_hash:
+            return _ToolCallHash(compact_digest, "")
+        target_length = max(
+            len(name) + len(standardized_arguments),
+            _TOOL_CALL_HASH_MIN_LENGTH,
+        )
+        extended_hash = cls._extend_hex_digest(compact_digest.hex(), target_length)
+        return _ToolCallHash(compact_digest, extended_hash)
+
+    @staticmethod
+    def _extend_hex_digest(hex_digest: str, target_length: int) -> str:
+        if len(hex_digest) >= target_length:
+            return hex_digest[:target_length]
+        result = hex_digest
+        counter = 0
+        while len(result) < target_length:
+            result += hashlib.sha256(
+                hex_digest.encode() + str(counter).encode()
+            ).hexdigest()
+            counter += 1
+        return result[:target_length]
+
+
+class _ToolCallDupDetector:
+    """Track approved tool call digests and count trailing consecutive repeats."""
 
     def __init__(self) -> None:
-        self._accumulated: str = ""
-        self._current_id: str | None = None
+        self._sequence: list[bytes] = []
+        self._positions_by_digest: dict[bytes, list[int]] = {}
 
-    def feed(self, delta_str: str, tc_id: str) -> str:
-        result = ""
-        if self._current_id != tc_id:
-            self._current_id = tc_id
-            result = self._flush_and_hash()
-        self._accumulated += delta_str
-        return result
+    def record(self, digest: bytes) -> None:
+        index = len(self._sequence)
+        self._sequence.append(digest)
+        positions = self._positions_by_digest.get(digest)
+        if positions is None:
+            self._positions_by_digest[digest] = [index]
+        else:
+            positions.append(index)
 
-    def _flush_and_hash(self) -> str:
-        if not self._accumulated:
-            return ""
-        hash_len = max(len(self._accumulated), 32)
-        h = hashlib.sha256(self._accumulated.encode()).hexdigest()
-        self._accumulated = ""
-        if len(h) >= hash_len:
-            return h[:hash_len]
-        # Extend with counter-based hashes to avoid repeating patterns
-        result = h
-        counter = 0
-        while len(result) < hash_len:
-            result += hashlib.sha256(h.encode() + str(counter).encode()).hexdigest()
-            counter += 1
-        return result[:hash_len]
+    def count_trailing_repeats_with_next(self, next_digest: bytes) -> int:
+        prior_positions = self._positions_by_digest.get(next_digest)
+        if not prior_positions:
+            return 1
+        seq_len = len(self._sequence)
+        best_repeats = 1
+        for previous_index in reversed(prior_positions):
+            block_len = seq_len - previous_index
+            if (seq_len + 1) // block_len <= best_repeats:
+                break
+            repeats = self._count_block_repeats(next_digest, previous_index, block_len)
+            if repeats > best_repeats:
+                best_repeats = repeats
+        return best_repeats
+
+    def _count_block_repeats(
+        self, next_digest: bytes, previous_index: int, block_len: int
+    ) -> int:
+        repeats = 1
+        if block_len == 1:
+            index = previous_index
+            while index >= 0 and self._sequence[index] == next_digest:
+                repeats += 1
+                index -= 1
+            return repeats
+        prefix = self._sequence[previous_index + 1 :]
+        start = previous_index + 1 - block_len
+        while start >= 0:
+            if (
+                self._sequence[start + block_len - 1] == next_digest
+                and self._sequence[start : start + block_len - 1] == prefix
+            ):
+                repeats += 1
+                start -= block_len
+            else:
+                break
+        return repeats
 
 
 class _StreamLoopDetector:
@@ -574,20 +698,65 @@ class _AsyncBytesStream:
         return self._data
 
 
-class _DeltaSerializer:
-    """Wraps tool call hasher and section separators to produce loop detector feeds."""
+@dataclass(frozen=True, slots=True)
+class _SerializedDelta:
+    """One flushed stream item ready for guardrail checks."""
 
-    def __init__(self) -> None:
-        self._hasher = _ToolCallHasher()
+    serialized_text: str
+    delta: dict
+    raw_bytes: bytes
+    is_tool_call: bool = False
+    tool_call_digest: bytes | None = None
+    standardized_arguments: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class _StandardizedToolCall:
+    """One tool call with standardized arguments."""
+
+    name: str
+    arguments: str
+
+
+def _extract_post_user_assistant_messages(messages: list[dict]) -> list[dict]:
+    start = 0
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].get("role") == "user":
+            start = i + 1
+            break
+    return [message for message in messages[start:] if message.get("role") == "assistant"]
+
+
+def _iter_standardized_tool_calls(message: dict) -> Iterable[_StandardizedToolCall]:
+    for tc in message.get("tool_calls") or []:
+        func = tc.get("function") or {}
+        name = func.get("name") or ""
+        raw_arguments = func.get("arguments") or ""
+        if not name and not raw_arguments:
+            continue
+        yield _StandardizedToolCall(name, standardize_json_arguments(raw_arguments))
+
+
+class _DeltaSerializer:
+    """Buffers tool calls, frames sections, and hashes completed tool calls."""
+
+    def __init__(
+        self,
+        *,
+        should_extend_hash: bool = True,
+        should_hash_tool_calls: bool = True,
+    ) -> None:
+        self._should_extend_hash = should_extend_hash
+        self._should_hash_tool_calls = should_hash_tool_calls
         self._last_separator: str | None = None
         self._current_tool_call_id: str = ""
+        self._has_pending_tool_call: bool = False
         self._pending_tool_call_bytes: bytearray = bytearray()
         self._pending_tool_call_delta: dict = {"type": "tool_call"}
-        self._results: deque[tuple[str, dict, bytes]] = deque()
-        self._on_data: Callable[[str, dict, bytes], None] | None = None
+        self._results: deque[_SerializedDelta] = deque()
+        self._on_data: Callable[[_SerializedDelta], None] | None = None
 
     def _accumulate_tool_call_delta(self, delta: dict) -> None:
-        """Merge a tool call delta into _pending_tool_call_delta."""
         tc_id = delta.get("tool_call_id", "")
         text = delta.get("text", "")
         func = delta.get("function")
@@ -606,87 +775,134 @@ class _DeltaSerializer:
                     "arguments"
                 ]
 
+    def _append_hashed_tool_call(
+        self,
+        name: str,
+        standardized_arguments: str,
+        delta: dict,
+        raw_bytes: bytes,
+    ) -> None:
+        hashed = _ToolCallHasher.hash_tool_call(
+            name,
+            standardized_arguments,
+            should_extend_hash=self._should_extend_hash,
+        )
+        if hashed is None:
+            return
+        serialized_text = (
+            "[tool_call]" + hashed.extended_hash if self._should_extend_hash else ""
+        )
+        self._results.append(
+            _SerializedDelta(
+                serialized_text,
+                delta,
+                raw_bytes,
+                is_tool_call=True,
+                tool_call_digest=hashed.compact_digest,
+                standardized_arguments=standardized_arguments,
+            )
+        )
+        self._last_separator = "[tool_call]"
+
+    def _flush_pending_tool_call(self) -> None:
+        if not self._has_pending_tool_call:
+            return
+        delta = self._pending_tool_call_delta
+        raw_bytes = bytes(self._pending_tool_call_bytes)
+        self._has_pending_tool_call = False
+        self._pending_tool_call_bytes.clear()
+        self._pending_tool_call_delta = {"type": "tool_call"}
+        func = delta.get("function") or {}
+        name = func.get("name") or ""
+        raw_arguments = func.get("arguments") or ""
+        if not name and not raw_arguments:
+            if raw_bytes:
+                self._results.append(_SerializedDelta("", {}, raw_bytes))
+            return
+        if not self._should_hash_tool_calls:
+            self._results.append(
+                _SerializedDelta("", delta, raw_bytes, is_tool_call=True)
+            )
+            return
+        standardized_arguments = standardize_json_arguments(raw_arguments)
+        self._append_hashed_tool_call(name, standardized_arguments, delta, raw_bytes)
+
     def feed(self, delta: dict, raw_bytes: bytes = b"") -> None:
-        """Feed a delta for serialization."""
         text = delta.get("text", "")
         tp = delta.get("type", "")
-
-        # Special handling for tool call: accmulate delta and lazy flush
-        tool_call_id = delta.get("tool_call_id", "")
         if tp == "tool_call":
-            if tool_call_id:
-                self._current_tool_call_id = tool_call_id
-            else:
-                tool_call_id = self._current_tool_call_id
-        # Accumulate tool call hashes until the entire tool call section is complete.
-        # Always feed in order to trigger lazy flush even if the text is empty.
-        tool_call_text = text if tp == "tool_call" else ""
-        tool_call_hash = self._hasher.feed(tool_call_text, tool_call_id)
-        if tool_call_hash:
-            # Tool call completed. Flush the accumulated tool call hash and raw bytes.
-            self._results.append(
-                (
-                    "[tool_call]" + tool_call_hash,
-                    self._pending_tool_call_delta,
-                    bytes(self._pending_tool_call_bytes),
-                )
-            )
-            self._pending_tool_call_bytes.clear()
-            self._pending_tool_call_delta = {"type": "tool_call"}
-            self._last_separator = "[tool_call]"
-
-        if tp == "tool_call":
-            # Valid tool call delta. Cache the raw bytes and delta until it completes.
+            incoming_id = delta.get("tool_call_id", "")
+            if (
+                self._has_pending_tool_call
+                and incoming_id
+                and incoming_id != self._current_tool_call_id
+            ):
+                self._flush_pending_tool_call()
+            if incoming_id:
+                self._current_tool_call_id = incoming_id
+            self._has_pending_tool_call = True
             self._accumulate_tool_call_delta(delta)
             self._pending_tool_call_bytes.extend(raw_bytes)
-        elif tp in ("content", "reasoning"):
-            # Add separator for reasoning and content types
-            separator = f"[{tp}]"
-            if self._last_separator != separator:
-                self._results.append((f"{separator}" + text, delta, raw_bytes))
-            else:
-                self._results.append((text, delta, raw_bytes))
-            self._last_separator = separator
         else:
-            # Other types. Pass through as is.
-            self._results.append((text, delta, raw_bytes))
+            if self._has_pending_tool_call:
+                self._flush_pending_tool_call()
+                self._current_tool_call_id = ""
+            if tp in ("content", "reasoning"):
+                separator = f"[{tp}]"
+                if self._last_separator != separator:
+                    self._results.append(
+                        _SerializedDelta(f"{separator}{text}", delta, raw_bytes)
+                    )
+                else:
+                    self._results.append(_SerializedDelta(text, delta, raw_bytes))
+                self._last_separator = separator
+            else:
+                self._results.append(_SerializedDelta(text, delta, raw_bytes))
+        self._flush()
+
+    def feed_complete_tool_call(
+        self, name: str, standardized_arguments: str
+    ) -> None:
+        self._flush_pending_tool_call()
+        self._current_tool_call_id = ""
+        self._append_hashed_tool_call(
+            name, standardized_arguments, {"type": "tool_call"}, b""
+        )
         self._flush()
 
     def feed_passthrough(self, raw_bytes: bytes) -> None:
-        """Keep raw bytes in order without flushing a pending tool call."""
-        if "text" in self._pending_tool_call_delta:
+        if self._has_pending_tool_call:
             self._pending_tool_call_bytes.extend(raw_bytes)
             return
-        self._results.append(("", {}, raw_bytes))
+        self._results.append(_SerializedDelta("", {}, raw_bytes))
         self._flush()
 
-    def poll(self) -> list[tuple[str, dict, bytes]]:
-        result = []
+    def discard_pending_tool_call(self) -> None:
+        self._current_tool_call_id = ""
+        self._has_pending_tool_call = False
+        self._pending_tool_call_bytes.clear()
+        self._pending_tool_call_delta = {"type": "tool_call"}
+        self._results.clear()
+
+    def poll(self) -> list[_SerializedDelta]:
+        result: list[_SerializedDelta] = []
         size = len(self._results)
         for _i in range(size):
             result.append(self._results.popleft())
         return result
 
     def finalize(self) -> Self:
-        """Complete any pending tool call and return this serializer.
-
-        Returns:
-            This serializer, so the flushed results can be read with poll().
-        """
-        # Feeding empty delta will complete pending tool calls.
         self.feed({})
         return self
 
-    def set_data_callback(self, callback: Callable[[str, dict, bytes], None]) -> None:
-        """Add a callback to monitor structured output from this serializer without manual poll."""
+    def set_data_callback(self, callback: Callable[[_SerializedDelta], None]) -> None:
         self._on_data = callback
         self._flush()
 
     def _flush(self) -> None:
-        """Flush results to the callback."""
         if self._on_data:
-            for serialized_text, delta, raw_bytes in self.poll():
-                self._on_data(serialized_text, delta, raw_bytes)
+            for item in self.poll():
+                self._on_data(item)
 
 
 class _Session:
@@ -706,7 +922,7 @@ class _Session:
         api_format: ConversationAPIFormat,
         messages: list[dict] | None = None,
         resumption_state: _ResumptionState | None = None,
-        dedup_exclusions: list[ToolCallExclusion] | None = None,
+        dedup_exclusions: list[_DedupExclusion] | None = None,
     ) -> None:
         self.is_stream = is_stream
         self.api_format = api_format
@@ -724,55 +940,57 @@ class _Session:
         self._resumption_state: _ResumptionState = (
             resumption_state if resumption_state is not None else _ResumptionState()
         )
-        self._dedup_exclusions: list[ToolCallExclusion] = dedup_exclusions or []
+        self._dedup_exclusions: list[_DedupExclusion] = dedup_exclusions or []
         self.is_ok = False
         self.prepared = False
         self._upstream_streaming = False
         self._has_finish_reason = False
         self._loop_detector = _StreamLoopDetector(min_block_size=self.min_loop_distance)
-        self._tool_call_dup_detector = _StreamLoopDetector(
-            min_block_size=_TOOL_CALL_LOOP_DETECTOR_MIN_DISTANCE
+        self._tool_call_dup_detector = _ToolCallDupDetector()
+        self._delta_serializer = _DeltaSerializer(
+            should_extend_hash=self.break_loops,
+            should_hash_tool_calls=self.break_loops or self.dedup_tool_calls,
         )
-        self._delta_serializer: _DeltaSerializer = _DeltaSerializer()
         if messages and (break_loops or dedup_tool_calls):
-            chat_history = self._serialize_history(messages)
-            if break_loops:
-                self._init_loop_history(chat_history)
-            if dedup_tool_calls:
-                self._init_tool_call_history(chat_history)
+            self._prime_history(messages)
         self._delta_serializer.set_data_callback(self._on_serialized_data)
 
-    def _serialize_history(self, messages: list[dict]) -> str:
-        """Serialize chat history into a single string from the last user turn."""
-        start = 0
-        for i in range(len(messages) - 1, -1, -1):
-            if messages[i].get("role") == "user":
-                start = i + 1
-                break
-        for m in messages[start:]:
-            role = m.get("role")
-            if role == "assistant":
-                for key in ("reasoning_content", "content"):
-                    text = m.get(key)
-                    if text:
-                        tp = "reasoning" if key == "reasoning_content" else "content"
-                        self._delta_serializer.feed({"type": tp, "text": text})
-                for tc in m.get("tool_calls") or []:
-                    func = tc.get("function") or {}
-                    name = func.get("name") or ""
-                    args = standardize_json_arguments(func.get("arguments") or "")
-                    tc_text = name + args
-                    tc_id = tc.get("id") or ""
-                    if tc_text:
-                        self._delta_serializer.feed(
-                            {
-                                "type": "tool_call",
-                                "text": tc_text,
-                                "tool_call_id": tc_id,
-                            }
-                        )
-        serializer = self._delta_serializer.finalize()
-        return "".join([s for s, _, _ in serializer.poll()])
+    def _prime_history(self, messages: list[dict]) -> None:
+        assistant_messages = _extract_post_user_assistant_messages(messages)
+        if self.break_loops:
+            self._prime_history_with_serializer(assistant_messages)
+        elif self.dedup_tool_calls:
+            self._prime_tool_call_history_directly(assistant_messages)
+
+    def _prime_history_with_serializer(self, assistant_messages: list[dict]) -> None:
+        for message in assistant_messages:
+            for key in ("reasoning_content", "content"):
+                text = message.get(key)
+                if text:
+                    tp = "reasoning" if key == "reasoning_content" else "content"
+                    self._delta_serializer.feed({"type": tp, "text": text})
+            for tool_call in _iter_standardized_tool_calls(message):
+                self._delta_serializer.feed_complete_tool_call(
+                    tool_call.name, tool_call.arguments
+                )
+        items = self._delta_serializer.finalize().poll()
+        chat_history = "".join(item.serialized_text for item in items)
+        self._init_loop_history(chat_history)
+        if self.dedup_tool_calls:
+            for item in items:
+                if item.tool_call_digest is not None:
+                    self._tool_call_dup_detector.record(item.tool_call_digest)
+
+    def _prime_tool_call_history_directly(
+        self, assistant_messages: list[dict]
+    ) -> None:
+        for message in assistant_messages:
+            for tool_call in _iter_standardized_tool_calls(message):
+                hashed = _ToolCallHasher.hash_tool_call(
+                    tool_call.name, tool_call.arguments, should_extend_hash=False
+                )
+                if hashed is not None:
+                    self._tool_call_dup_detector.record(hashed.compact_digest)
 
     def _init_loop_history(self, chat_history: str) -> None:
         """Initialize loop detector with non-looping assistant history suffix.
@@ -790,36 +1008,6 @@ class _Session:
             suffix = chat_history[safe_start:]
             self._loop_detector.feed(suffix)
 
-    def _init_tool_call_history(self, chat_history: str) -> None:
-        """Init tool call detector with [tool_call] sections from serialized history."""
-        tc_text = ""
-        pos = 0
-        prefix = "[tool_call]"
-        while pos < len(chat_history):
-            start = chat_history.find(prefix, pos)
-            if start < 0:
-                break
-            # Find next section marker to avoid false matches with `[` in content
-            best_end = len(chat_history)
-            for marker in ("[reasoning]", "[content]", "[tool_call]"):
-                idx = chat_history.find(marker, start + len(prefix))
-                if 0 <= idx < best_end:
-                    best_end = idx
-            tc_text += chat_history[start + len(prefix) : best_end]
-            pos = best_end
-
-        if not tc_text:
-            return
-        safe_start = _safe_suffix_start(
-            tc_text, _TOOL_CALL_LOOP_DETECTOR_MIN_DISTANCE, 5
-        )
-        if safe_start < len(tc_text):
-            # The reversed scan found no loop here, and a loop read backwards is still a loop.
-            self._tool_call_dup_detector = _StreamLoopDetector(
-                min_block_size=_TOOL_CALL_LOOP_DETECTOR_MIN_DISTANCE,
-                loop_free_history=tc_text[safe_start:],
-            )
-
     @staticmethod
     def _build_tool_call_hint(tc_text: str) -> str:
         truncated = (tc_text[:50] + "...") if tc_text and len(tc_text) > 50 else tc_text
@@ -831,13 +1019,51 @@ class _Session:
         """Get the session-level resumption state."""
         return self._resumption_state
 
-    def _on_serialized_data(
-        self, serialized_str: str, delta: dict, raw_bytes: bytes
-    ) -> None:
+    def _validate_and_record_tool_call(self, item: _SerializedDelta) -> None:
+        delta = item.delta
+        tc_text = delta.get("text", "")
+        tc_hint = self._build_tool_call_hint(tc_text)
+        arguments = (delta.get("function") or {}).get("arguments") or ""
+        name = (delta.get("function") or {}).get("name") or ""
+        if self.validate_tool_calls and arguments:
+            try:
+                json.loads(arguments)
+            except (json.JSONDecodeError, ValueError):
+                raise _Retry(
+                    "SYSTEM [EXTREMELY IMPORTANT DO NOT IGNORE]: Your last response "
+                    "was interrupted because a tool call had invalid JSON arguments. "
+                    f"Always use valid JSON for tool call arguments.{tc_hint}",
+                    _RETRY_INVALID_TOOL_CALL,
+                )
+        if self.dedup_tool_calls and item.tool_call_digest is not None:
+            limit = _resolve_dedup_limit(
+                name, item.standardized_arguments, self._dedup_exclusions
+            )
+            if (
+                limit is not None
+                and self._tool_call_dup_detector.count_trailing_repeats_with_next(
+                    item.tool_call_digest
+                )
+                > limit
+            ):
+                raise _Retry(
+                    "SYSTEM [EXTREMELY IMPORTANT DO NOT IGNORE]: Your last response "
+                    "was interrupted because you are repeating the same tool call you "
+                    f"already made or duplicate the same tool call multiple times in your response.{tc_hint} "
+                    "If you want to edit a file, the edit is probably already applied — read it to confirm first. "
+                    "If you want to read a file, you already read it previously and the result is in your context — refer to it. "
+                    "If you want to execute a command, the command is already executed — refer to your previous context for the result.",
+                    _RETRY_DUP_TOOL_CALL,
+                )
+            self._tool_call_dup_detector.record(item.tool_call_digest)
+
+    def _on_serialized_data(self, item: _SerializedDelta) -> None:
         """Handle serialized data."""
+        serialized_str = item.serialized_text
+        delta = item.delta
+        raw_bytes = item.raw_bytes
         if self.retries < self.max_retries:
             loop_detected = False
-            dup_tool_call_detected = False
             try:
                 # Loop detection
                 if self.break_loops and self._loop_detector.feed(serialized_str):
@@ -849,39 +1075,8 @@ class _Session:
                         "the user's request.",
                         _RETRY_LOOP,
                     )
-                # Tool call validation
-                if serialized_str.startswith("[tool_call]"):
-                    tc_hash = serialized_str[len("[tool_call]") :]
-                    tc_text = delta.get("text", "")
-                    tc_hint = self._build_tool_call_hint(tc_text)
-                    arguments = (delta.get("function") or {}).get("arguments") or ""
-                    name = (delta.get("function") or {}).get("name") or ""
-                    if self.validate_tool_calls and arguments:
-                        try:
-                            json.loads(arguments)
-                        except (json.JSONDecodeError, ValueError):
-                            raise _Retry(
-                                "SYSTEM [EXTREMELY IMPORTANT DO NOT IGNORE]: Your last response "
-                                "was interrupted because a tool call had invalid JSON arguments. "
-                                f"Always use valid JSON for tool call arguments.{tc_hint}",
-                                _RETRY_INVALID_TOOL_CALL,
-                            )
-                    if (
-                        self.dedup_tool_calls
-                        and tc_hash
-                        and not is_tool_call_excluded(name, arguments, self._dedup_exclusions)
-                        and self._tool_call_dup_detector.feed(tc_hash)
-                    ):
-                        dup_tool_call_detected = True
-                        raise _Retry(
-                            "SYSTEM [EXTREMELY IMPORTANT DO NOT IGNORE]: Your last response "
-                            "was interrupted because you are repeating the same tool call you "
-                            f"already made or duplicate the same tool call multiple times in your response.{tc_hint} "
-                            "If you want to edit a file, the edit is probably already applied — read it to confirm first. "
-                            "If you want to read a file, you already read it previously and the result is in your context — refer to it. "
-                            "If you want to execute a command, the command is already executed — refer to your previous context for the result.",
-                            _RETRY_DUP_TOOL_CALL,
-                        )
+                if item.is_tool_call:
+                    self._validate_and_record_tool_call(item)
                 # Finish reason check
                 if self.force_final_output:
                     system_prompt_for_content_retry = (
@@ -930,8 +1125,6 @@ class _Session:
             except:
                 if loop_detected:
                     self._loop_detector.pop_last()
-                if dup_tool_call_detected:
-                    self._tool_call_dup_detector.pop_last()
                 raise
 
         self._resumption_state.feed(delta)
@@ -942,6 +1135,7 @@ class _Session:
 
     def on_retry(self) -> None:
         """Mark that the current attempt is being retried."""
+        self._delta_serializer.discard_pending_tool_call()
         self._retry_stream_combiner.begin_retry()
 
     async def on_prepared(
@@ -1063,10 +1257,8 @@ class OpenAIGuardRail(PluginBase):
         super().__init__(config, service_config)
         self._resumption_state: _LRUOrderedDict = _LRUOrderedDict()
         self._telemetry: _Telemetry = _Telemetry()
-        self._dedup_exclusions: list[ToolCallExclusion] = parse_tool_call_exclusions(
-            config.get("tool_call_dedup_exclusions", []),
-            "OpenAIGuardRail",
-            "tool_call_dedup_exclusions",
+        self._dedup_exclusions: list[_DedupExclusion] = _parse_dedup_exclusions(
+            config.get("tool_call_dedup_exclusions", [])
         )
         self._ui_publish: Callable[[str, str], None] | None = None
         self._ui_refresh_task: asyncio.Task[None] | None = None

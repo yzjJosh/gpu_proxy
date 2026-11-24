@@ -5,6 +5,7 @@ import multiprocessing
 import random
 import time
 import uuid
+from dataclasses import dataclass
 from multiprocessing.connection import Connection
 from typing import Awaitable, Callable, Optional
 from unittest.mock import MagicMock, AsyncMock
@@ -31,6 +32,7 @@ from tests.app.conftest import (
     extract_sse_tool_call_args,
     extract_sse_tool_call_name,
 )
+from app.config import ConfigError
 from app.plugins.openai_guard_rail import OpenAIGuardRail
 from app.responses import AbstractMutatingResponse
 
@@ -2063,6 +2065,822 @@ class TestDedupToolCallExclusions:
         await _drive_result(plugin, upstream.forward, client)
         assert upstream.calls == 2
         _assert_retry_names_tool_call(upstream, "write_file")
+
+
+@dataclass(frozen=True, slots=True)
+class _HistoricalToolCall:
+    """One past assistant tool call in a test conversation."""
+
+    name: str
+    arguments: str
+    tool_call_id: str
+
+
+def _build_tool_call_history(
+    calls: list[_HistoricalToolCall],
+) -> list[dict]:
+    """Build a single-user-turn history of assistant tool calls and tool results."""
+    messages: list[dict] = [_user_message()]
+    for index, call in enumerate(calls):
+        messages.append(
+            _assistant_tool_call(call.name, call.arguments, tc_id=call.tool_call_id)
+        )
+        messages.append(_tool_result(f"result_{index}", call.tool_call_id))
+    return messages
+
+
+def _build_repeated_tool_call_reply(
+    name: str, args: dict, count: int, id_prefix: str = "tc"
+) -> bytes:
+    """Build one streaming reply containing count consecutive copies of a tool call."""
+    chunks = b"".join(
+        sse_tool_call(f"{id_prefix}{index}", name, args) for index in range(count)
+    )
+    return chunks + sse_finish_reason("1", "tool_calls") + sse_done()
+
+
+class TestMaxDupExclusionCount:
+    """Bounded consecutive duplicate counts for tool_call_dedup_exclusions."""
+
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            pytest.param({"tool_name_regex": "^task$"}, id="omitted"),
+            pytest.param({"tool_name_regex": "^task$", "max_dup_exclusion_count": None}, id="null"),
+            pytest.param({"tool_name_regex": "^task$", "max_dup_exclusion_count": 1}, id="one"),
+            pytest.param({"tool_name_regex": "^task$", "max_dup_exclusion_count": 2}, id="two"),
+            pytest.param({"tool_name_regex": "^task$", "max_dup_exclusion_count": 5}, id="five"),
+        ],
+    )
+    def test_valid_max_dup_exclusion_count_configs(self, entry: dict) -> None:
+        """Valid max_dup_exclusion_count entries pass plugin startup validation."""
+        plugin = OpenAIGuardRail(
+            {"dedup_tool_calls": True, "tool_call_dedup_exclusions": [entry]}
+        )
+        assert plugin.name() == "openai_guard_rail"
+
+    @pytest.mark.parametrize(
+        "entry, expected_pattern",
+        [
+            pytest.param(
+                {"tool_name_regex": "^task$", "max_dup_exclusion_count": 0},
+                r"OpenAIGuardRail: tool_call_dedup_exclusions\[0\] max_dup_exclusion_count",
+                id="zero",
+            ),
+            pytest.param(
+                {"tool_name_regex": "^task$", "max_dup_exclusion_count": -1},
+                r"OpenAIGuardRail: tool_call_dedup_exclusions\[0\] max_dup_exclusion_count",
+                id="negative",
+            ),
+            pytest.param(
+                {"tool_name_regex": "^task$", "max_dup_exclusion_count": True},
+                r"OpenAIGuardRail: tool_call_dedup_exclusions\[0\] max_dup_exclusion_count",
+                id="bool-true",
+            ),
+            pytest.param(
+                {"tool_name_regex": "^task$", "max_dup_exclusion_count": False},
+                r"OpenAIGuardRail: tool_call_dedup_exclusions\[0\] max_dup_exclusion_count",
+                id="bool-false",
+            ),
+            pytest.param(
+                {"tool_name_regex": "^task$", "max_dup_exclusion_count": 1.5},
+                r"OpenAIGuardRail: tool_call_dedup_exclusions\[0\] max_dup_exclusion_count",
+                id="float",
+            ),
+            pytest.param(
+                {"tool_name_regex": "^task$", "max_dup_exclusion_count": "2"},
+                r"OpenAIGuardRail: tool_call_dedup_exclusions\[0\] max_dup_exclusion_count",
+                id="string",
+            ),
+            pytest.param(
+                {"tool_name_regex": "^task$", "max_dup_exclusion_count": [2]},
+                r"OpenAIGuardRail: tool_call_dedup_exclusions\[0\] max_dup_exclusion_count",
+                id="list",
+            ),
+            pytest.param(
+                {"tool_name_regex": "^task$", "max_dup_exclusion_count": {"n": 2}},
+                r"OpenAIGuardRail: tool_call_dedup_exclusions\[0\] max_dup_exclusion_count",
+                id="dict",
+            ),
+            pytest.param(
+                {"tool_name_regex": "^task$", "unknown_key": 3},
+                r"OpenAIGuardRail: tool_call_dedup_exclusions\[0\].*unrecognized key.*unknown_key",
+                id="unknown-key",
+            ),
+            pytest.param(
+                {"max_dup_exclusion_count": 3},
+                r"OpenAIGuardRail: tool_call_dedup_exclusions\[0\].*tool_name_regex or tool_args_regex",
+                id="count-without-regex",
+            ),
+        ],
+    )
+    def test_invalid_max_dup_exclusion_count_raises_config_error(
+        self, entry: dict, expected_pattern: str
+    ) -> None:
+        """Invalid max_dup_exclusion_count entries fail fast with ConfigError at startup."""
+        with pytest.raises(ConfigError, match=expected_pattern):
+            OpenAIGuardRail({"tool_call_dedup_exclusions": [entry]})
+
+    @pytest.mark.parametrize("limit", [1, 2, 3])
+    async def test_single_response_allows_up_to_limit_and_retries_next(
+        self, limit: int
+    ) -> None:
+        """A single response allows N consecutive repeats and retries on call N + 1."""
+        plugin = OpenAIGuardRail(
+            {
+                "dedup_tool_calls": True,
+                "tool_call_dedup_exclusions": [
+                    {"tool_name_regex": "^task$", "max_dup_exclusion_count": limit}
+                ],
+            }
+        )
+        args = {"action": "status", "id": "1"}
+
+        at_limit_upstream = _Upstream(_build_repeated_tool_call_reply("task", args, limit))
+        await _drive_result(plugin, at_limit_upstream.forward, _make_client_response())
+        assert at_limit_upstream.calls == 1
+
+        over_limit_upstream = _Upstream(
+            _build_repeated_tool_call_reply("task", args, limit + 1),
+            _recovered_reply(finish_reason="stop"),
+        )
+        await _drive_result(plugin, over_limit_upstream.forward, _make_client_response())
+        assert over_limit_upstream.calls == 2
+        _assert_retry_names_tool_call(over_limit_upstream, "task")
+
+    @pytest.mark.parametrize("limit", [1, 2, 3])
+    async def test_cross_request_allows_up_to_limit_and_retries_next(
+        self, limit: int
+    ) -> None:
+        """Consecutive repeats across HTTP requests in one turn follow the N limit."""
+        plugin = OpenAIGuardRail(
+            {
+                "dedup_tool_calls": True,
+                "tool_call_dedup_exclusions": [
+                    {"tool_name_regex": "^task$", "max_dup_exclusion_count": limit}
+                ],
+            }
+        )
+        args_dict = {"action": "status", "id": "1"}
+        args_json = json.dumps(args_dict)
+
+        at_limit_history = _build_tool_call_history(
+            [
+                _HistoricalToolCall("task", args_json, f"h{index}")
+                for index in range(limit - 1)
+            ]
+        )
+        at_limit_upstream = _Upstream(
+            _build_repeated_tool_call_reply("task", args_dict, 1, "live")
+        )
+        await _drive_result(
+            plugin,
+            at_limit_upstream.forward,
+            _make_client_response(),
+            _request(at_limit_history),
+        )
+        assert at_limit_upstream.calls == 1
+
+        over_limit_history = _build_tool_call_history(
+            [
+                _HistoricalToolCall("task", args_json, f"h{index}")
+                for index in range(limit)
+            ]
+        )
+        over_limit_upstream = _Upstream(
+            _build_repeated_tool_call_reply("task", args_dict, 1, "live"),
+            _recovered_reply(finish_reason="stop"),
+        )
+        await _drive_result(
+            plugin,
+            over_limit_upstream.forward,
+            _make_client_response(),
+            _request(over_limit_history),
+        )
+        assert over_limit_upstream.calls == 2
+        _assert_retry_names_tool_call(over_limit_upstream, "task")
+
+    async def test_unlimited_exclusion_passes_after_many_repeats(self) -> None:
+        """Omitting max_dup_exclusion_count allows repeats beyond any fixed cap."""
+        plugin = OpenAIGuardRail(
+            {
+                "dedup_tool_calls": True,
+                "tool_call_dedup_exclusions": [
+                    {"tool_name_regex": "^task$", "max_dup_exclusion_count": None}
+                ],
+            }
+        )
+        args_dict = {"action": "status", "id": "1"}
+        history = _build_tool_call_history(
+            [
+                _HistoricalToolCall("task", json.dumps(args_dict), f"h{index}")
+                for index in range(5)
+            ]
+        )
+        upstream = _Upstream(_build_repeated_tool_call_reply("task", args_dict, 2, "live"))
+        await _drive_result(plugin, upstream.forward, _make_client_response(), _request(history))
+        assert upstream.calls == 1
+
+    async def test_mixed_history_and_multi_call_response(self) -> None:
+        """History calls combine with multiple calls in the active response."""
+        plugin = OpenAIGuardRail(
+            {
+                "dedup_tool_calls": True,
+                "tool_call_dedup_exclusions": [
+                    {"tool_name_regex": "^task$", "max_dup_exclusion_count": 3}
+                ],
+            }
+        )
+        args_dict = {"action": "status"}
+        history = _build_tool_call_history(
+            [
+                _HistoricalToolCall("task", json.dumps(args_dict), "h0"),
+                _HistoricalToolCall("task", json.dumps(args_dict), "h1"),
+            ]
+        )
+
+        pass_upstream = _Upstream(
+            _build_repeated_tool_call_reply("task", args_dict, 1, "live")
+        )
+        await _drive_result(
+            plugin, pass_upstream.forward, _make_client_response(), _request(history)
+        )
+        assert pass_upstream.calls == 1
+
+        retry_upstream = _Upstream(
+            _build_repeated_tool_call_reply("task", args_dict, 2, "live"),
+            _recovered_reply(finish_reason="stop"),
+        )
+        await _drive_result(
+            plugin, retry_upstream.forward, _make_client_response(), _request(history)
+        )
+        assert retry_upstream.calls == 2
+        _assert_retry_names_tool_call(retry_upstream, "task")
+
+    async def test_idless_and_empty_historical_tool_calls(self) -> None:
+        """ID-less history calls count independently and empty history calls are skipped."""
+        plugin = OpenAIGuardRail(
+            {
+                "break_loops": True,
+                "dedup_tool_calls": True,
+                "tool_call_dedup_exclusions": [
+                    {"tool_name_regex": "^task$", "max_dup_exclusion_count": 2}
+                ],
+            }
+        )
+        args_dict = {"action": "status"}
+        args_json = json.dumps(args_dict)
+        history = [
+            _user_message(),
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"id": "", "type": "function", "function": {"name": "task", "arguments": args_json}},
+                    {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
+                    {"id": "", "type": "function", "function": {"name": "task", "arguments": args_json}},
+                ],
+            },
+            _tool_result("ok", ""),
+        ]
+        upstream = _Upstream(
+            _build_repeated_tool_call_reply("task", args_dict, 1, "live"),
+            _recovered_reply(finish_reason="stop"),
+        )
+        await _drive_result(
+            plugin, upstream.forward, _make_client_response(), _request(history)
+        )
+        assert upstream.calls == 2
+        _assert_retry_names_tool_call(upstream, "task")
+
+    async def test_chunked_compact_json_matches_standardized_history_and_args_regex(
+        self,
+    ) -> None:
+        """Multi-chunk compact JSON arguments standardize once on completion."""
+        plugin = OpenAIGuardRail(
+            {
+                "dedup_tool_calls": True,
+                "tool_call_dedup_exclusions": [
+                    {
+                        "tool_name_regex": "^task$",
+                        "tool_args_regex": '"action": "status"',
+                        "max_dup_exclusion_count": 2,
+                    }
+                ],
+            }
+        )
+        compact_chunks = (
+            _chunk({"tool_calls": [{"index": 0, "id": "live1", "type": "function", "function": {"name": "task", "arguments": '{"action":'}}]})
+            + _chunk({"tool_calls": [{"index": 0, "function": {"arguments": '"status","id":"1"}'}}]})
+            + sse_finish_reason("1", "tool_calls")
+            + sse_done()
+        )
+        history_one = _build_tool_call_history(
+            [_HistoricalToolCall("task", '{"action": "status", "id": "1"}', "h0")]
+        )
+        pass_upstream = _Upstream(compact_chunks)
+        await _drive_result(
+            plugin, pass_upstream.forward, _make_client_response(), _request(history_one)
+        )
+        assert pass_upstream.calls == 1
+
+        history_two = _build_tool_call_history(
+            [
+                _HistoricalToolCall("task", '{"action":"status","id":"1"}', "h0"),
+                _HistoricalToolCall("task", '{"action": "status", "id": "1"}', "h1"),
+            ]
+        )
+        retry_upstream = _Upstream(compact_chunks, _recovered_reply(finish_reason="stop"))
+        await _drive_result(
+            plugin, retry_upstream.forward, _make_client_response(), _request(history_two)
+        )
+        assert retry_upstream.calls == 2
+        _assert_retry_names_tool_call(retry_upstream, "task")
+
+    async def test_large_payload_tool_call_bounded_by_limit(self) -> None:
+        """Large tool call payloads are hashed and bounded accurately."""
+        plugin = OpenAIGuardRail(
+            {
+                "dedup_tool_calls": True,
+                "tool_call_dedup_exclusions": [
+                    {"tool_name_regex": "^write_blob$", "max_dup_exclusion_count": 2}
+                ],
+            }
+        )
+        large_args = {"data": "x" * 12000}
+        history = _build_tool_call_history(
+            [
+                _HistoricalToolCall("write_blob", json.dumps(large_args), "h0"),
+                _HistoricalToolCall("write_blob", json.dumps(large_args), "h1"),
+            ]
+        )
+        upstream = _Upstream(
+            _build_repeated_tool_call_reply("write_blob", large_args, 1, "live"),
+            _recovered_reply(finish_reason="stop"),
+        )
+        await _drive_result(
+            plugin, upstream.forward, _make_client_response(), _request(history)
+        )
+        assert upstream.calls == 2
+
+    async def test_multi_call_cycle_same_limit(self) -> None:
+        """A repeating two-call cycle passes through count N and retries on N + 1."""
+        plugin = OpenAIGuardRail(
+            {
+                "dedup_tool_calls": True,
+                "tool_call_dedup_exclusions": [
+                    {"tool_name_regex": "^(poll_a|poll_b)$", "max_dup_exclusion_count": 2}
+                ],
+            }
+        )
+        args_a = {"k": "a"}
+        args_b = {"k": "b"}
+        pass_reply = (
+            sse_tool_call("c1", "poll_a", args_a)
+            + sse_tool_call("c2", "poll_b", args_b)
+            + sse_tool_call("c3", "poll_a", args_a)
+            + sse_tool_call("c4", "poll_b", args_b)
+            + sse_tool_call("c5", "poll_a", args_a)
+            + sse_finish_reason("1", "tool_calls")
+            + sse_done()
+        )
+        pass_upstream = _Upstream(pass_reply)
+        await _drive_result(plugin, pass_upstream.forward, _make_client_response())
+        assert pass_upstream.calls == 1
+
+        retry_reply = (
+            sse_tool_call("c1", "poll_a", args_a)
+            + sse_tool_call("c2", "poll_b", args_b)
+            + sse_tool_call("c3", "poll_a", args_a)
+            + sse_tool_call("c4", "poll_b", args_b)
+            + sse_tool_call("c5", "poll_a", args_a)
+            + sse_tool_call("c6", "poll_b", args_b)
+            + sse_finish_reason("1", "tool_calls")
+            + sse_done()
+        )
+        retry_upstream = _Upstream(retry_reply, _recovered_reply(finish_reason="stop"))
+        await _drive_result(plugin, retry_upstream.forward, _make_client_response())
+        assert retry_upstream.calls == 2
+        _assert_retry_names_tool_call(retry_upstream, "poll_b")
+
+    async def test_multi_call_cycle_mixed_limits(self) -> None:
+        """In a mixed cycle, the call completing a repeat checks its own effective limit."""
+        plugin = OpenAIGuardRail(
+            {
+                "dedup_tool_calls": True,
+                "tool_call_dedup_exclusions": [
+                    {"tool_name_regex": "^poll_a$", "max_dup_exclusion_count": 2}
+                ],
+            }
+        )
+        args_a = {"k": "a"}
+        args_b = {"k": "b"}
+
+        ab_upstream = _Upstream(
+            sse_tool_call("c1", "poll_a", args_a)
+            + sse_tool_call("c2", "other_b", args_b)
+            + sse_tool_call("c3", "poll_a", args_a)
+            + sse_tool_call("c4", "other_b", args_b)
+            + sse_finish_reason("1", "tool_calls")
+            + sse_done(),
+            _recovered_reply(finish_reason="stop"),
+        )
+        await _drive_result(plugin, ab_upstream.forward, _make_client_response())
+        assert ab_upstream.calls == 2
+        _assert_retry_names_tool_call(ab_upstream, "other_b")
+
+        ba_pass_upstream = _Upstream(
+            sse_tool_call("c1", "other_b", args_b)
+            + sse_tool_call("c2", "poll_a", args_a)
+            + sse_tool_call("c3", "other_b", args_b)
+            + sse_tool_call("c4", "poll_a", args_a)
+            + sse_finish_reason("1", "tool_calls")
+            + sse_done()
+        )
+        await _drive_result(plugin, ba_pass_upstream.forward, _make_client_response())
+        assert ba_pass_upstream.calls == 1
+
+        ba_retry_upstream = _Upstream(
+            sse_tool_call("c1", "other_b", args_b)
+            + sse_tool_call("c2", "poll_a", args_a)
+            + sse_tool_call("c3", "other_b", args_b)
+            + sse_tool_call("c4", "poll_a", args_a)
+            + sse_tool_call("c5", "other_b", args_b)
+            + sse_finish_reason("1", "tool_calls")
+            + sse_done(),
+            _recovered_reply(finish_reason="stop"),
+        )
+        await _drive_result(plugin, ba_retry_upstream.forward, _make_client_response())
+        assert ba_retry_upstream.calls == 2
+        _assert_retry_names_tool_call(ba_retry_upstream, "other_b")
+
+    @pytest.mark.parametrize(
+        "exclusions",
+        [
+            pytest.param(
+                [
+                    {"tool_name_regex": "^task$", "max_dup_exclusion_count": 2},
+                    {"tool_name_regex": "^task$", "tool_args_regex": "status", "max_dup_exclusion_count": 4},
+                ],
+                id="smaller-first",
+            ),
+            pytest.param(
+                [
+                    {"tool_name_regex": "^task$", "tool_args_regex": "status", "max_dup_exclusion_count": 4},
+                    {"tool_name_regex": "^task$", "max_dup_exclusion_count": 2},
+                ],
+                id="larger-first",
+            ),
+        ],
+    )
+    async def test_multi_match_bounded_uses_largest_limit_independent_of_order(
+        self, exclusions: list[dict]
+    ) -> None:
+        """When multiple bounded rules match, the largest count wins regardless of order."""
+        plugin = OpenAIGuardRail(
+            {"dedup_tool_calls": True, "tool_call_dedup_exclusions": exclusions}
+        )
+        args = {"action": "status"}
+        pass_upstream = _Upstream(_build_repeated_tool_call_reply("task", args, 4))
+        await _drive_result(plugin, pass_upstream.forward, _make_client_response())
+        assert pass_upstream.calls == 1
+
+        retry_upstream = _Upstream(
+            _build_repeated_tool_call_reply("task", args, 5),
+            _recovered_reply(finish_reason="stop"),
+        )
+        await _drive_result(plugin, retry_upstream.forward, _make_client_response())
+        assert retry_upstream.calls == 2
+
+    @pytest.mark.parametrize(
+        "exclusions",
+        [
+            pytest.param(
+                [
+                    {"tool_name_regex": "^task$", "max_dup_exclusion_count": 2},
+                    {"tool_name_regex": "^task$", "tool_args_regex": "status"},
+                ],
+                id="bounded-first",
+            ),
+            pytest.param(
+                [
+                    {"tool_name_regex": "^task$", "tool_args_regex": "status"},
+                    {"tool_name_regex": "^task$", "max_dup_exclusion_count": 2},
+                ],
+                id="unlimited-first",
+            ),
+        ],
+    )
+    async def test_multi_match_unlimited_wins_independent_of_order(
+        self, exclusions: list[dict]
+    ) -> None:
+        """When an unlimited rule and a bounded rule both match, unlimited wins."""
+        plugin = OpenAIGuardRail(
+            {"dedup_tool_calls": True, "tool_call_dedup_exclusions": exclusions}
+        )
+        upstream = _Upstream(
+            _build_repeated_tool_call_reply("task", {"action": "status"}, 5)
+        )
+        await _drive_result(plugin, upstream.forward, _make_client_response())
+        assert upstream.calls == 1
+
+    async def test_retry_exhaustion_telemetry_and_immediate_retrigger_on_next_request(
+        self,
+    ) -> None:
+        """Exhausted retries pass through, increment telemetry, and re-trigger on next turn."""
+        plugin = OpenAIGuardRail(
+            {
+                "dedup_tool_calls": True,
+                "max_retry_attempt": 1,
+                "tool_call_dedup_exclusions": [
+                    {"tool_name_regex": "^task$", "max_dup_exclusion_count": 2}
+                ],
+            }
+        )
+        published_ui: list[tuple[str, str]] = []
+        plugin.init_ui(lambda title, html: published_ui.append((title, html)))
+        args_dict = {"action": "status"}
+        args_json = json.dumps(args_dict)
+
+        history_two = _build_tool_call_history(
+            [
+                _HistoricalToolCall("task", args_json, "h0"),
+                _HistoricalToolCall("task", args_json, "h1"),
+            ]
+        )
+        exhaust_upstream = _Upstream(
+            _build_repeated_tool_call_reply("task", args_dict, 1, "attempt0"),
+            _build_repeated_tool_call_reply("task", args_dict, 1, "attempt1"),
+        )
+        client = _make_client_response()
+        await _drive_result(
+            plugin, exhaust_upstream.forward, client, _request(history_two)
+        )
+        assert exhaust_upstream.calls == 2
+        assert extract_sse_tool_call_name(_written(client)) == "task"
+        assert published_ui
+        assert "Duplicate Tool Call" in published_ui[-1][1]
+        assert ">1<" in published_ui[-1][1]
+
+        history_three = _build_tool_call_history(
+            [
+                _HistoricalToolCall("task", args_json, "h0"),
+                _HistoricalToolCall("task", args_json, "h1"),
+                _HistoricalToolCall("task", args_json, "h2"),
+            ]
+        )
+        next_upstream = _Upstream(
+            _build_repeated_tool_call_reply("task", args_dict, 1, "next0"),
+            _recovered_reply(finish_reason="stop"),
+        )
+        await _drive_result(
+            plugin, next_upstream.forward, _make_client_response(), _request(history_three)
+        )
+        assert next_upstream.calls == 2
+        _assert_retry_names_tool_call(next_upstream, "task")
+
+    @pytest.mark.parametrize(
+        "breaker_name",
+        [
+            pytest.param("write_file", id="non-excluded-call"),
+            pytest.param("read_file", id="unlimited-excluded-call"),
+        ],
+    )
+    async def test_streak_resets_after_different_tool_call(
+        self, breaker_name: str
+    ) -> None:
+        """Emitting any different tool call resets the bounded streak to full allowance."""
+        plugin = OpenAIGuardRail(
+            {
+                "dedup_tool_calls": True,
+                "tool_call_dedup_exclusions": [
+                    {"tool_name_regex": "^task$", "max_dup_exclusion_count": 2},
+                    {"tool_name_regex": "^read_file$"},
+                ],
+            }
+        )
+        task_args = {"action": "status"}
+        task_json = json.dumps(task_args)
+        history_after_break = _build_tool_call_history(
+            [
+                _HistoricalToolCall("task", task_json, "h0"),
+                _HistoricalToolCall("task", task_json, "h1"),
+                _HistoricalToolCall(breaker_name, '{"path": "a.txt"}', "h2"),
+            ]
+        )
+        pass_upstream = _Upstream(
+            _build_repeated_tool_call_reply("task", task_args, 2, "live")
+        )
+        await _drive_result(
+            plugin,
+            pass_upstream.forward,
+            _make_client_response(),
+            _request(history_after_break),
+        )
+        assert pass_upstream.calls == 1
+
+        retry_upstream = _Upstream(
+            _build_repeated_tool_call_reply("task", task_args, 3, "live"),
+            _recovered_reply(finish_reason="stop"),
+        )
+        await _drive_result(
+            plugin,
+            retry_upstream.forward,
+            _make_client_response(),
+            _request(history_after_break),
+        )
+        assert retry_upstream.calls == 2
+
+    async def test_streak_resets_on_new_user_turn(self) -> None:
+        """A new user message resets prior duplicate streaks."""
+        plugin = OpenAIGuardRail(
+            {
+                "dedup_tool_calls": True,
+                "tool_call_dedup_exclusions": [
+                    {"tool_name_regex": "^task$", "max_dup_exclusion_count": 2}
+                ],
+            }
+        )
+        args_dict = {"action": "status"}
+        args_json = json.dumps(args_dict)
+        history = _build_tool_call_history(
+            [
+                _HistoricalToolCall("task", args_json, "h0"),
+                _HistoricalToolCall("task", args_json, "h1"),
+            ]
+        ) + [_user_message("check again")]
+        upstream = _Upstream(_build_repeated_tool_call_reply("task", args_dict, 2, "live"))
+        await _drive_result(
+            plugin, upstream.forward, _make_client_response(), _request(history)
+        )
+        assert upstream.calls == 1
+
+    async def test_packed_chunk_retry_discards_uncommitted_next_call(self) -> None:
+        """A packed chunk opening a next call does not leak across retry to break a streak."""
+        plugin = OpenAIGuardRail(
+            {
+                "dedup_tool_calls": True,
+                "max_retry_attempt": 2,
+                "tool_call_dedup_exclusions": [
+                    {"tool_name_regex": "^task$", "max_dup_exclusion_count": 2}
+                ],
+            }
+        )
+        task_args = '{"action": "status"}'
+        history = _build_tool_call_history(
+            [
+                _HistoricalToolCall("task", task_args, "h0"),
+                _HistoricalToolCall("task", task_args, "h1"),
+            ]
+        )
+        call_open = _chunk(
+            {
+                "tool_calls": [
+                    {
+                        "index": 0,
+                        "id": "tcA3",
+                        "type": "function",
+                        "function": {"name": "task", "arguments": task_args[:-1]},
+                    }
+                ]
+            }
+        )
+        packed = _chunk(
+            {
+                "tool_calls": [
+                    {"index": 0, "function": {"arguments": task_args[-1]}},
+                    {
+                        "index": 1,
+                        "id": "tcLeak",
+                        "type": "function",
+                        "function": {"name": "other_tool", "arguments": '{"k": "v"}'},
+                    },
+                ]
+            }
+        )
+        attempt_one = call_open + packed + sse_done()
+        attempt_two = _build_repeated_tool_call_reply(
+            "task", {"action": "status"}, 1, "tcRetry"
+        )
+        attempt_three = CHAT_WIRE.reply("3", ("content", "recovered"))
+        upstream = _Upstream(attempt_one, attempt_two, attempt_three)
+
+        written, _ = await _drive_wire(
+            plugin, CHAT_WIRE, upstream, CHAT_WIRE.request(history)
+        )
+        assert upstream.calls == 3
+        assert extract_sse_field(written) == "recovered"
+        assert "other_tool" not in upstream.bodies[1].decode()
+
+    @pytest.mark.parametrize("stream", [True, False], ids=["stream", "non-stream"])
+    async def test_api_parity_bounded_exclusion_and_reset(
+        self, wire: Wire, stream: bool
+    ) -> None:
+        """Bounded exclusion passes at N, retries at N + 1, and resets after recovery on both APIs."""
+        plugin = OpenAIGuardRail(
+            {
+                "dedup_tool_calls": True,
+                "tool_call_dedup_exclusions": [
+                    {"tool_name_regex": "^task$", "max_dup_exclusion_count": 2}
+                ],
+            }
+        )
+        args_dict = {"action": "status"}
+        args_json = json.dumps(args_dict)
+
+        at_limit_history = _build_tool_call_history(
+            [_HistoricalToolCall("task", args_json, "h0")]
+        )
+        at_limit_upstream = _Upstream(
+            wire.reply("1", ("tool_call", "live1", "task", args_dict))
+        )
+        await _drive_wire(
+            plugin, wire, at_limit_upstream, wire.request(at_limit_history, stream=stream)
+        )
+        assert at_limit_upstream.calls == 1
+
+        over_limit_history = _build_tool_call_history(
+            [
+                _HistoricalToolCall("task", args_json, "h0"),
+                _HistoricalToolCall("task", args_json, "h1"),
+            ]
+        )
+        over_limit_upstream = _Upstream(
+            wire.reply("1", ("tool_call", "live2", "task", args_dict)),
+            wire.reply("2", ("content", "recovered")),
+        )
+        written, _ = await _drive_wire(
+            plugin,
+            wire,
+            over_limit_upstream,
+            wire.request(over_limit_history, stream=stream),
+        )
+        assert over_limit_upstream.calls == 2
+        if stream:
+            assert wire.content_of(written) == "recovered"
+        else:
+            assert "recovered" in json.dumps(json.loads(written))
+
+        reset_history = _build_tool_call_history(
+            [
+                _HistoricalToolCall("task", args_json, "h0"),
+                _HistoricalToolCall("task", args_json, "h1"),
+                _HistoricalToolCall("write_file", '{"path": "x"}', "h2"),
+            ]
+        )
+        reset_upstream = _Upstream(
+            wire.reply(
+                "3",
+                ("tool_call", "live3", "task", args_dict),
+                ("tool_call", "live4", "task", args_dict),
+            )
+        )
+        await _drive_wire(
+            plugin, wire, reset_upstream, wire.request(reset_history, stream=stream)
+        )
+        assert reset_upstream.calls == 1
+
+    async def test_break_loops_stays_independent_and_preserves_history_continuity(
+        self,
+    ) -> None:
+        """break_loops still catches loops on excluded calls and across history boundaries."""
+        plugin = OpenAIGuardRail(
+            {
+                "break_loops": True,
+                "min_loop_distance": 50,
+                "dedup_tool_calls": True,
+                "tool_call_dedup_exclusions": [
+                    {"tool_name_regex": "^task$", "max_dup_exclusion_count": 5}
+                ],
+            }
+        )
+        large_args = {"action": "status", "detail": "long_payload_" * 6}
+        loop_upstream = _Upstream(
+            _build_repeated_tool_call_reply("task", large_args, 2),
+            _recovered_reply(finish_reason="stop"),
+        )
+        await _drive_result(plugin, loop_upstream.forward, _make_client_response())
+        assert loop_upstream.calls == 2
+        assert "repetition loop" in _forwarded_system_message(loop_upstream)
+
+        suffix = "repeated_history_suffix_block_1234567890_" * 2
+        history = [
+            _user_message(),
+            _assistant_tool_call("task", '{"action": "status"}', tc_id="h0"),
+            _tool_result("ok", "h0"),
+            _assistant_message("prefix_content_" + suffix),
+        ]
+        continuity_upstream = _Upstream(
+            sse_content("1", suffix) + sse_finish_reason("1", "stop") + sse_done(),
+            _recovered_reply(finish_reason="stop"),
+        )
+        await _drive_result(
+            plugin,
+            continuity_upstream.forward,
+            _make_client_response(),
+            _request(history),
+        )
+        assert continuity_upstream.calls == 2
+        assert "repetition loop" in _forwarded_system_message(continuity_upstream)
 
 
 # ── Same work on every API ──

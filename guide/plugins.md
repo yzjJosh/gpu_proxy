@@ -62,7 +62,7 @@ All checks are off by default, so turn on the ones you want:
 | `break_loops` | `false` | Turn this on to retry when the model starts repeating itself. |
 | `min_loop_distance` | `50` | How many characters have to repeat before `break_loops` treats the text as a loop. |
 | `dedup_tool_calls` | `false` | Turn this on to retry if the model repeats a tool call with the same arguments after the latest user message. |
-| `tool_call_dedup_exclusions` | none | Tool calls that `dedup_tool_calls` lets the model repeat. See [Tool call patterns](#tool-call-patterns). |
+| `tool_call_dedup_exclusions` | none | Tool calls that `dedup_tool_calls` lets the model repeat. Each entry can also set an optional `max_dup_exclusion_count` integer (`>= 1`). Leaving it out or setting it to `null` allows unlimited repeats. Setting it to `N` lets `N` consecutive occurrences pass and triggers a retry on the `(N + 1)`-th consecutive occurrence, resetting once a different tool call or a new user turn breaks the streak. When multiple entries match the same tool call, the most permissive limit wins (unlimited beats any number, otherwise the largest number wins). `break_loops` stays independent of these exclusions. See [Tool call patterns](#tool-call-patterns). |
 | `validate_tool_calls` | `false` | Turn this on to retry when a tool call's arguments aren't valid JSON. |
 | `force_final_output` | `false` | Turn this on to retry when a reply ends with no text and no tool call. |
 | `max_retry_attempt` | `2` | The most times the plugin retries one reply. |
@@ -126,7 +126,9 @@ Plain values like numbers and strings replace whatever the app sent. Objects mer
 
 ## Tool call patterns
 
-`tool_call_dedup_exclusions` and `tool_call_prune_exclusions` each take a list of patterns. A pattern can set `tool_name_regex`, `tool_args_regex` or both. When a pattern sets both, a tool call must match both. `tool_args_regex` searches the arguments as raw JSON text.
+`tool_call_dedup_exclusions` and `tool_call_prune_exclusions` each take a list of patterns. A pattern can set `tool_name_regex`, `tool_args_regex` or both. When a pattern sets both, a tool call must match both. In `OpenAIGuardRail`, `tool_args_regex` searches the completed tool call arguments after JSON standardization (for example, `": "` after colons). In `OpenAIContextModifier`, it searches the historical arguments as sent by the client.
+
+`tool_call_dedup_exclusions` entries also accept an optional `max_dup_exclusion_count` integer (`>= 1`, omitted or `null` for unlimited). `tool_call_prune_exclusions` does not support `max_dup_exclusion_count` and rejects unrecognized keys at startup.
 
 ```yaml
 tool_call_prune_exclusions:

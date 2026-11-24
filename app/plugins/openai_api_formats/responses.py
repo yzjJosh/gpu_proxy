@@ -14,7 +14,6 @@ from app.plugins.openai_api_formats.base import (
     StreamEventParser,
     TokenUsage,
     build_tool_call_update,
-    standardize_json_arguments,
 )
 from app.plugins.utils import SSEByteDecoder
 
@@ -644,14 +643,14 @@ class _ResponsesStreamEventParser(StreamEventParser):
             return None
         call_id = item.get("call_id") or ""
         tool_name = item.get("name") or ""
-        arguments = standardize_json_arguments(item.get("arguments") or "")
+        arguments = item.get("arguments") or ""
         if isinstance(item.get("id"), str):
             self._call_id_by_item_id[item["id"]] = call_id
         self._streamed_function_calls.append((call_id, tool_name))
         return build_tool_call_update(tool_name, arguments, call_id)
 
     def _parse_function_call_arguments_delta_event(self, stream_event: dict) -> dict:
-        arguments = standardize_json_arguments(stream_event.get("delta") or "")
+        arguments = stream_event.get("delta") or ""
         call_id = self._call_id_by_item_id.get(str(stream_event.get("item_id")), "")
         return build_tool_call_update("", arguments, call_id)
 
