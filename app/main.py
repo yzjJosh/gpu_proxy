@@ -74,7 +74,7 @@ async def _run_server(
         watchdog: The watchdog to stop on shutdown.
         ping_task: The watchdog ping task to cancel on shutdown.
     """
-    runner = web.AppRunner(app)
+    runner = web.AppRunner(app, handler_cancellation=True)
     try:
         await runner.setup()
         site = web.TCPSite(runner, "0.0.0.0", port)

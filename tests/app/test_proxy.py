@@ -349,7 +349,11 @@ class ProxyHarness:
         await self.proxy.start()
         app = web.Application()
         app.router.add_route("*", "/{path:.*}", self.proxy.proxy_handler)
-        self._runner = web.AppRunner(app, shutdown_timeout=SHUTDOWN_TIMEOUT)
+        self._runner = web.AppRunner(
+            app,
+            shutdown_timeout=SHUTDOWN_TIMEOUT,
+            handler_cancellation=True,
+        )
         await self._runner.setup()
         await web.TCPSite(self._runner, LOCALHOST, self.port).start()
         self._session = ClientSession(timeout=ClientTimeout(total=CLIENT_TIMEOUT))
@@ -1961,10 +1965,9 @@ class TestWebSocketProxying:
             await harness.send("/socket", "svc.local", headers=WS_UPGRADE_HEADERS)
 
     async def test_gpu_routed_socket_holds_the_budget(
-        self, gpu_service: ProxyHarness, target: UpstreamServer
+        self, gpu_service: ProxyHarness
     ) -> None:
         """A GPU-routed socket counts as in-flight until it closes."""
-        target.ws_close_after = 1
         async with gpu_service.websocket("/v1/completions", "svc.local") as ws:
             await ws.send_str("hi")
             assert (await ws.receive()).data == "target:hi"
@@ -1972,6 +1975,23 @@ class TestWebSocketProxying:
             assert (await gpu_service.service("svc"))["state"] == "hot"
         assert await gpu_service.wait_for_in_flight("svc", 0) == 0
         assert (await gpu_service.routing("svc"))["target"] == 1
+
+    async def test_websocket_client_disconnect_is_cancelled_not_failed(
+        self, gpu_service: ProxyHarness, backup: UpstreamServer
+    ) -> None:
+        """Dropping a GPU-routed socket releases in-flight without backup or failure."""
+        ws = await gpu_service.session.ws_connect(
+            f"{gpu_service.base_url}/v1/completions",
+            headers={"Host": "svc.local"},
+        )
+        await ws.send_str("hi")
+        assert (await ws.receive()).data == "target:hi"
+        assert await gpu_service.wait_for_in_flight("svc", 1) == 1
+        await ws.close()
+        assert await gpu_service.wait_for_in_flight("svc", 0) == 0
+        assert len(backup.requests) == 0
+        assert await gpu_service.events("target_failed", "svc") == []
+        assert await gpu_service.events("backup_failed", "svc") == []
 
     async def test_gpu_routed_socket_uses_backup_without_gpu_data(
         self, gpu_service: ProxyHarness, backup: UpstreamServer, fake_gpu: FakeGpu
@@ -2035,6 +2055,108 @@ class TestStreaming:
         assert await gpu_service.wait_for_in_flight("svc", 0) == 0
         assert len(backup.requests) == 0
         assert (await gpu_service.routing("svc"))["backup"] == 0
+        assert await gpu_service.events("target_failed", "svc") == []
+        assert await gpu_service.events("backup_failed", "svc") == []
+
+    async def test_client_disconnect_before_headers_skips_backup_and_failure_log(
+        self,
+        start_with_plugins: StartWithPlugins,
+        target: UpstreamServer,
+        backup: UpstreamServer,
+    ) -> None:
+        """A client disconnecting before response headers cancels without failover."""
+        svc = replace(
+            make_service("svc", target.url),
+            backup=backup.url,
+            gpu_routes=["/v1/completions"],
+            plugins=["tracker"],
+        )
+        harness, manager = await start_with_plugins(
+            [svc],
+            [plugin_entry("tracker", "CancelTrackingPlugin")],
+            [CancelTrackingPlugin],
+        )
+        target.response_delay = STALLED_RESPONSE
+        pending = asyncio.create_task(
+            harness.send("/v1/completions", "svc.local", "POST", b"{}")
+        )
+        await wait_until(lambda: bool(target.requests))
+        assert await harness.wait_for_in_flight("svc", 1) == 1
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        assert await harness.wait_for_in_flight("svc", 0) == 0
+        assert len(backup.requests) == 0
+        assert (await harness.routing("svc"))["backup"] == 0
+        assert await harness.events("target_failed", "svc") == []
+        assert await harness.events("backup_failed", "svc") == []
+        plugin = manager.get_plugin_instance("svc", "tracker")
+        assert plugin.cancelled_requests == [1]
+
+    async def test_concurrent_waiter_survives_other_client_disconnecting(
+        self,
+        start_proxy: StartProxy,
+        target: UpstreamServer,
+        backup: UpstreamServer,
+        fake_gpu: FakeGpu,
+    ) -> None:
+        """One disconnecting waiter does not cancel another waiting for the same service."""
+        blocker = replace(
+            make_service("blocker", backup.url, priority=2, vram_budget=LARGE_SERVICE_VRAM),
+            container="blocker",
+            gpu_routes=["/api"],
+        )
+        svc = replace(
+            make_service("svc", target.url, priority=1, vram_budget=LARGE_SERVICE_VRAM),
+            gpu_routes=["/v1/completions"],
+        )
+        fake_gpu.occupy({"blocker": LARGE_SERVICE_VRAM})
+        harness = await start_proxy(
+            make_config([blocker, svc], free_port(), eviction_timeout=PATIENT_EVICTION)
+        )
+        await harness.wait_for_state("blocker", "warm")
+
+        backup.response_delay = STALLED_RESPONSE
+        blocker_req = asyncio.create_task(
+            harness.send("/api", "blocker.local", "POST", b"{}")
+        )
+        await wait_until(lambda: bool(backup.requests))
+        await harness.wait_for_state("blocker", "hot")
+
+        waiter_one = asyncio.create_task(
+            harness.send("/v1/completions", "svc.local", "POST", b"{}")
+        )
+        waiter_two = asyncio.create_task(
+            harness.send("/v1/completions", "svc.local", "POST", b"{}")
+        )
+        await harness.wait_for_state("blocker", "evicting")
+        await wait_until(
+            lambda: any(
+                entry.service_name == "svc" and entry.waiters == 2
+                for entry in harness.proxy.wait_queue.entries
+            )
+        )
+
+        waiter_one.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter_one
+        await wait_until(
+            lambda: any(
+                entry.service_name == "svc" and entry.waiters == 1
+                for entry in harness.proxy.wait_queue.entries
+            )
+        )
+        assert not waiter_two.done()
+
+        blocker_req.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await blocker_req
+        fake_gpu.release_all()
+
+        reply = await waiter_two
+        assert reply.status == HTTP_OK
+        assert reply.body == b"upstream-ok"
+        assert len(target.requests) == 1
 
 
 class TestLoopbackDetection:
@@ -2610,12 +2732,12 @@ class TestPrepareTargetPipeline:
 
 
 class TestCancelledForward:
-    """A forward cancelled mid-flight reaches the result callbacks with no message."""
+    """A forward cancelled mid-flight is treated as a cancellation, not a failure."""
 
-    async def test_cancelled_forward_is_logged_without_a_message(
+    async def test_cancelled_forward_is_not_recorded_as_failure(
         self, start_with_plugins: StartWithPlugins, target: UpstreamServer
     ) -> None:
-        """Cancellation carries no error string, so the failure is recorded bare."""
+        """Cancelling a target forward does not record a target failure."""
         svc = replace(make_service("svc", target.url), plugins=["canceller"])
         harness, _ = await start_with_plugins(
             [svc],
@@ -2625,13 +2747,12 @@ class TestCancelledForward:
         target.response_delay = STALLED_RESPONSE
         reply = await harness.send("/cancel-forward", "svc.local", "POST", b"{}")
         assert reply.status == HTTP_OK
-        failures = await harness.events("target_failed", "svc")
-        assert [entry["details"] for entry in failures] == [""]
+        assert await harness.events("target_failed", "svc") == []
 
-    async def test_cancelled_backup_forward_is_logged_without_a_message(
+    async def test_cancelled_backup_forward_is_not_recorded_as_failure(
         self, start_with_plugins: StartWithPlugins, backup: UpstreamServer
     ) -> None:
-        """Cancellation of the retry after a dead target is recorded bare too."""
+        """Cancelling a backup retry after a dead target does not record a backup failure."""
         svc = replace(
             make_service("svc", f"http://{LOCALHOST}:{free_port()}"),
             backup=backup.url,
@@ -2645,17 +2766,16 @@ class TestCancelledForward:
         backup.response_delay = STALLED_RESPONSE
         reply = await harness.send("/cancel-forward", "svc.local", "POST", b"{}")
         assert reply.status == HTTP_OK
-        failures = await harness.events("backup_failed", "svc")
-        assert [entry["details"] for entry in failures] == [""]
+        assert await harness.events("backup_failed", "svc") == []
 
-    async def test_cancelled_diverted_forward_is_logged_without_a_message(
+    async def test_cancelled_diverted_forward_is_not_recorded_as_failure(
         self,
         start_with_plugins: StartWithPlugins,
         target: UpstreamServer,
         backup: UpstreamServer,
         fake_gpu: FakeGpu,
     ) -> None:
-        """A request diverted straight to the backup records the same bare failure."""
+        """Cancelling a request diverted straight to backup does not record a failure."""
         svc = replace(
             make_service("svc", target.url),
             backup=backup.url,
@@ -2676,8 +2796,7 @@ class TestCancelledForward:
         reply = await harness.send("/cancel-forward", "svc.local", "POST", b"{}")
         assert reply.status == HTTP_OK
         assert target.requests == []
-        failures = await harness.events("backup_failed", "svc")
-        assert [entry["details"] for entry in failures] == [""]
+        assert await harness.events("backup_failed", "svc") == []
 
 
 class ResponseHeaderPlugin(HeaderPlugin):

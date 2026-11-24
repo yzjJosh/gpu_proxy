@@ -756,3 +756,86 @@ class TestImpossibleEvictionFastPath:
         gpu = _big_card(_ALMOST_ONE_SLOT_MIB, {"cpai": _SERVICE_BUDGET_MIB})
         decision = await _route("llamacpp-server", gpu, sample_config, states)
         assert decision == _IMPOSSIBLE_EVICTION
+
+
+class TestWaitQueueWait:
+    """Concurrent waiters share one entry without cancelling each other."""
+
+    async def test_wait_returns_already_resolved_decision(
+        self,
+        queue_config: ProxyConfig,
+        gpu_all_free: GPUStatus,
+        queue_states: dict[str, ServiceState],
+    ) -> None:
+        """Waiting on an already approved entry returns its decision right away."""
+        queue = _fresh_queue(process_on_enqueue=True)
+        try:
+            entry = await queue.enqueue(
+                "svc1", gpu_all_free, queue_config, queue_states
+            )
+            assert await queue.wait(entry) == _APPROVED
+        finally:
+            await queue.cancel_all()
+
+    async def test_cancelling_one_waiter_keeps_entry_for_remaining_waiter(
+        self,
+        gpu_all_free: GPUStatus,
+        queue_config: ProxyConfig,
+        queue_states: dict[str, ServiceState],
+    ) -> None:
+        """Cancelling one of two concurrent waiters leaves the entry alive."""
+        removed: list[bool] = []
+        queue = _fresh_queue(process_on_enqueue=False)
+        try:
+            entry = await queue.enqueue(
+                "svc1", gpu_all_free, queue_config, queue_states
+            )
+            waiter_one = asyncio.create_task(
+                queue.wait(entry, on_removed=lambda: removed.append(True))
+            )
+            waiter_two = asyncio.create_task(
+                queue.wait(entry, on_removed=lambda: removed.append(True))
+            )
+            await asyncio.sleep(0)
+
+            waiter_one.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await waiter_one
+
+            assert removed == []
+            assert _queued_names(queue) == ["svc1"]
+            assert not entry.future.cancelled()
+
+            await queue.process_wake_up(gpu_all_free, queue_config, queue_states)
+            assert await waiter_two == _APPROVED
+            assert removed == []
+        finally:
+            await queue.cancel_all()
+
+    async def test_cancelling_last_waiter_removes_entry_and_notifies(
+        self,
+        gpu_all_free: GPUStatus,
+        queue_config: ProxyConfig,
+        queue_states: dict[str, ServiceState],
+    ) -> None:
+        """Cancelling the only waiter removes the entry and runs on_removed."""
+        removed: list[bool] = []
+        queue = _fresh_queue(process_on_enqueue=False)
+        try:
+            entry = await queue.enqueue(
+                "svc1", gpu_all_free, queue_config, queue_states
+            )
+            waiter = asyncio.create_task(
+                queue.wait(entry, on_removed=lambda: removed.append(True))
+            )
+            await asyncio.sleep(0)
+
+            waiter.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await waiter
+
+            assert removed == [True]
+            assert _queued_names(queue) == []
+            assert entry.future.cancelled()
+        finally:
+            await queue.cancel_all()

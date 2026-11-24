@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from types import TracebackType
-from typing import Optional
+from typing import Callable, Optional
 
 from app.budget import compute_effective_remaining, get_eviction_candidates
 from app.gpu_monitor import ClockProtocol, GPUStatus
@@ -22,6 +22,7 @@ class _WaitEntry:
     service_name: str
     priority: int
     future: asyncio.Future = field(default_factory=asyncio.Future)
+    waiters: int = 0
     _timeout_task: Optional[asyncio.Task] = None
 
     def attach_timeout(self, task: asyncio.Task) -> None:
@@ -247,21 +248,45 @@ class VRAMWaitQueue:
             if entry and not entry.future.done():
                 entry.future.cancel()
 
+    async def wait(
+        self,
+        entry: _WaitEntry,
+        on_removed: Optional[Callable[[], None]] = None,
+    ) -> tuple[str, str]:
+        """Wait for a queue entry decision and clean up if the last waiter leaves.
+
+        Args:
+            entry: The queue entry to wait on.
+            on_removed: Optional callback run when an unresolved entry is removed.
+
+        Returns:
+            The routing decision and reason.
+        """
+        if entry.future.done():
+            return entry.future.result()
+        entry.waiters += 1
+        try:
+            return await asyncio.shield(entry.future)
+        finally:
+            entry.waiters -= 1
+            if entry.waiters == 0 and entry in self._entries:
+                self._discard_entry(entry)
+                if on_removed is not None:
+                    on_removed()
+
     async def cancel_all(self) -> None:
         """Cancel all pending timeout tasks in the queue."""
         async with self._lock:
             for entry in list(self._entries):
-                await self.cancel_entry(entry)
-            self._entries.clear()
+                self._discard_entry(entry)
 
-    async def cancel_entry(self, entry: _WaitEntry) -> None:
-        """Cancel an entry."""
-        async with self._lock:
-            entry.cancel_timeout()
-            if not entry.future.done():
-                entry.future.cancel()
-            if entry in self._entries:
-                self._entries.remove(entry)
+    def _discard_entry(self, entry: _WaitEntry) -> None:
+        """Remove an entry and cancel its timeout and future."""
+        if entry in self._entries:
+            self._entries.remove(entry)
+        entry.cancel_timeout()
+        if not entry.future.done():
+            entry.future.cancel()
 
     async def process_wake_up(
         self,

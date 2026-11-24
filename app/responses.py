@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import abc
 import asyncio
+from contextlib import contextmanager
 import json
 from http import HTTPStatus
-from typing import AsyncIterator, Awaitable, Callable, Optional, Union, override
+from typing import AsyncIterator, Awaitable, Callable, Iterator, Optional, Union, override
 from aiohttp import web
 from aiohttp.abc import AbstractStreamWriter
 
@@ -101,6 +102,31 @@ class AbstractMutatingResponse(web.StreamResponse, metaclass=abc.ABCMeta):
         """Chain a mutator into the response pipeline."""
 
 
+@contextmanager
+def _cancel_on_disconnect() -> Iterator[None]:
+    """Turn a client connection error into cancellation."""
+    try:
+        yield
+    except ConnectionError:
+        raise asyncio.CancelledError() from None
+
+
+async def _prepare_client_response(
+    response: AbstractMutatingResponse,
+    request: web.Request,
+    on_prepare: _HeaderMutatorFn,
+    prepare_parent: Callable[[web.Request], Awaitable[Optional[AbstractStreamWriter]]],
+) -> Optional[AbstractStreamWriter]:
+    """Prepare the response for a connected client."""
+    transport = request.transport
+    if transport is None or transport.is_closing() is True:
+        raise asyncio.CancelledError()
+    if not response.prepared:
+        response.headers.update(on_prepare(dict(response.headers), response.status))
+    with _cancel_on_disconnect():
+        return await prepare_parent(request)
+
+
 class MutatingStreamResponse(AbstractMutatingResponse):
     """An HTTP response with header and body changes."""
 
@@ -115,21 +141,21 @@ class MutatingStreamResponse(AbstractMutatingResponse):
 
     @override
     async def prepare(self, request: web.Request) -> Optional[AbstractStreamWriter]:
-        if not self.prepared:
-            self.headers.update(self._on_prepare(dict(self.headers), self.status))
-        return await super().prepare(request)
+        return await _prepare_client_response(
+            self, request, self._on_prepare, super().prepare
+        )
 
     @override
     async def write(self, chunk: Union[bytes, bytearray, memoryview]) -> None:
-        await super().write(
-            await self._on_write(dict(self.headers), chunk, False, self.status)
-        )
+        mutated = await self._on_write(dict(self.headers), chunk, False, self.status)
+        with _cancel_on_disconnect():
+            await super().write(mutated)
 
     @override
     async def write_eof(self, data: bytes = b"") -> None:
-        await super().write_eof(
-            await self._on_write(dict(self.headers), data, True, self.status)
-        )
+        mutated = await self._on_write(dict(self.headers), data, True, self.status)
+        with _cancel_on_disconnect():
+            await super().write_eof(mutated)
 
     @override
     def add_mutator(self, mutator: _MutatorFn) -> None:
@@ -150,22 +176,24 @@ class MutatingWebSocketResponse(web.WebSocketResponse, AbstractMutatingResponse)
 
     @override
     async def prepare(self, request: web.Request) -> Optional[AbstractStreamWriter]:
-        if not self.prepared:
-            self.headers.update(self._on_prepare(dict(self.headers), self.status))
-        return await super().prepare(request)
+        return await _prepare_client_response(
+            self, request, self._on_prepare, super().prepare
+        )
 
     @override
     async def send_str(self, message: str, compress: Optional[int] = None) -> None:
         encoded = message.encode("utf-8")
         mutated = await self._on_send({}, encoded, False, self.status)
-        await super().send_str(mutated.decode("utf-8"), compress=compress)
+        with _cancel_on_disconnect():
+            await super().send_str(mutated.decode("utf-8"), compress=compress)
 
     @override
     async def send_bytes(
         self, data: Union[bytes, bytearray, memoryview], compress: Optional[int] = None
     ) -> None:
         mutated = await self._on_send({}, data, False, self.status)
-        await super().send_bytes(mutated, compress=compress)
+        with _cancel_on_disconnect():
+            await super().send_bytes(mutated, compress=compress)
 
     @override
     async def send_json(
@@ -173,7 +201,8 @@ class MutatingWebSocketResponse(web.WebSocketResponse, AbstractMutatingResponse)
     ) -> None:
         raw = json.dumps(data).encode("utf-8")
         mutated = await self._on_send({}, raw, False, self.status)
-        await super().send_str(mutated.decode("utf-8"), compress=compress)
+        with _cancel_on_disconnect():
+            await super().send_str(mutated.decode("utf-8"), compress=compress)
 
     @override
     def add_mutator(self, mutator: _MutatorFn) -> None:

@@ -44,6 +44,10 @@ class _FakeRunner(web.AppRunner):
     so main()'s wiring is still verified.
     """
 
+    def __init__(self, app: web.Application, **kwargs: bool) -> None:
+        assert kwargs.get("handler_cancellation") is True
+        super().__init__(app, **kwargs)
+
     @override
     async def setup(self) -> None:
         # main() registers a catch-all route before building the runner.

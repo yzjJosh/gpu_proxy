@@ -353,27 +353,31 @@ class GpuPriorityProxy:
                 method, path, dict(request.query), request
             )
 
-        body = await request.read() if request.can_read_body else b""
-        is_ws = self.is_websocket_upgrade(dict(request.headers))
+        try:
+            body = await request.read() if request.can_read_body else b""
+            is_ws = self.is_websocket_upgrade(dict(request.headers))
 
-        if is_ws:
-            response = MutatingWebSocketResponse(identity_mutator)
-        else:
-            response = MutatingStreamResponse(identity_mutator, status=_HTTP_OK)
+            if is_ws:
+                response = MutatingWebSocketResponse(identity_mutator)
+            else:
+                response = MutatingStreamResponse(identity_mutator, status=_HTTP_OK)
 
-        result = await self._handle_request(
-            host,
-            path,
-            method,
-            request,
-            headers={
-                k: v
-                for k, v in request.headers.items()
-                if k.lower() not in _REQUEST_FRAMING_HEADERS
-            },
-            body=body,
-            response=response,
-        )
+            result = await self._handle_request(
+                host,
+                path,
+                method,
+                request,
+                headers={
+                    k: v
+                    for k, v in request.headers.items()
+                    if k.lower() not in _REQUEST_FRAMING_HEADERS
+                },
+                body=body,
+                response=response,
+            )
+        except asyncio.CancelledError:
+            _logger.info("Request cancelled for %s %s %s", host, method, path)
+            raise
         if isinstance(result, web.StreamResponse):
             return result
         return response
@@ -455,44 +459,44 @@ class GpuPriorityProxy:
             fr: web.Request,
             resp: AbstractMutatingResponse,
         ) -> bool:
-            try:
-                return await self._handle_service_request(
-                    service=service,
-                    host=host,
-                    path=fp,
-                    method=method,
-                    web_request=fr,
-                    response=resp,
-                    headers=fh,
-                    body=fb,
-                    recursion_depth=recursion_depth,
-                    commit_on_error=commit_on_error,
-                    request_id=request_id,
-                )
-            except:
-                if self._plugin_manager:
-                    self._plugin_manager.run_cancelled_pipeline(request_id, service.name)
-                raise
+            return await self._handle_service_request(
+                service=service,
+                host=host,
+                path=fp,
+                method=method,
+                web_request=fr,
+                response=resp,
+                headers=fh,
+                body=fb,
+                recursion_depth=recursion_depth,
+                commit_on_error=commit_on_error,
+                request_id=request_id,
+            )
 
-        # Check path overrides
-        if self._plugin_manager:
-            path_overrides = self._plugin_manager.get_path_overrides(service.name)
-            raw_path = urlparse(path).path
-            if raw_path in path_overrides:
-                plugin = path_overrides[raw_path]
-                forward = make_forward_guard(do_forward)
-                with forward_handler():
-                    return await plugin.handle_overridden_request(
-                        request_id,
-                        headers,
-                        body,
-                        path,
-                        web_request,
-                        forward,
-                        response,
-                    )
+        try:
+            # Check path overrides
+            if self._plugin_manager:
+                path_overrides = self._plugin_manager.get_path_overrides(service.name)
+                raw_path = urlparse(path).path
+                if raw_path in path_overrides:
+                    plugin = path_overrides[raw_path]
+                    forward = make_forward_guard(do_forward)
+                    with forward_handler():
+                        return await plugin.handle_overridden_request(
+                            request_id,
+                            headers,
+                            body,
+                            path,
+                            web_request,
+                            forward,
+                            response,
+                        )
 
-        return await do_forward(headers, body, path, web_request, response)
+            return await do_forward(headers, body, path, web_request, response)
+        except:
+            if self._plugin_manager:
+                self._plugin_manager.run_cancelled_pipeline(request_id, service.name)
+            raise
 
     async def _handle_dashboard_request(
         self,
@@ -736,29 +740,23 @@ class GpuPriorityProxy:
     ) -> bool:
         state = self.service_states[service.name]
 
-        entry = None
-        try:
-            # Try enqueue and check the decision made by the queue.
-            entry = await self.wait_queue.enqueue(
-                service.name, self.gpu_status, self.config, self.service_states
-            )
-            if not entry.future.done():
-                # We should wait for a decision. Try eviction if necessary.
-                asyncio.ensure_future(
-                    self._trigger_eviction(service)
-                ).add_done_callback(
-                    lambda f: (
-                        _logger.error("Eviction failed: %s", f.exception(), exc_info=True)
-                        if f.exception()
-                        else None
-                    )
+        entry = await self.wait_queue.enqueue(
+            service.name, self.gpu_status, self.config, self.service_states
+        )
+        if not entry.future.done():
+            # We should wait for a decision. Try eviction if necessary.
+            asyncio.ensure_future(
+                self._trigger_eviction(service)
+            ).add_done_callback(
+                lambda f: (
+                    _logger.error("Eviction failed: %s", f.exception(), exc_info=True)
+                    if f.exception()
+                    else None
                 )
-
-            # Get the decision.
-            decision, reason = await entry.future
-        finally:
-            if entry:
-                await self.wait_queue.cancel_entry(entry)
+            )
+        decision, reason = await self.wait_queue.wait(
+            entry, on_removed=self._trigger_queue_wake_up
+        )
 
         if decision == "target":
 
@@ -906,16 +904,6 @@ class GpuPriorityProxy:
             f'Request failed immediately with {status} error. Reason: "{reason}".'
         )
     
-    async def _monitor_disconnection(
-        self, request: web.Request, service_name: str, on_disconnected: Callable
-    ) -> None:
-        """Watch for a client disconnect and notify the caller while it persists."""
-        while True:
-            if request.transport.is_closing():
-                _logger.error(f"Client disconnected from service {service_name} before the request finishes!")
-                on_disconnected()
-            await asyncio.sleep(0.5)
-
     async def _proxy_http_request(
         self,
         url: str,
@@ -978,21 +966,13 @@ class GpuPriorityProxy:
                     _logger.error(f"Error: upstream server {url} responded status code {resp.status} and reason \"{resp.reason}\". Response body: {payload}.")
                     return False
 
-                monitor_task = None
-                try:
-                    await response.prepare(web_request)
-                    client_prepared = True
-                    monitor_task = asyncio.create_task(
-                        self._monitor_disconnection(web_request, service_name, resp.close)
-                    )
-                    # iter_any() yields data as soon as it's available from upstream,
-                    # which is essential for SSE streaming.
-                    async for chunk in resp.content.iter_any():
-                        await response.write(chunk)
-                finally:
-                    if monitor_task:
-                        monitor_task.cancel()
-                    await response.write_eof()
+                await response.prepare(web_request)
+                client_prepared = True
+                # iter_any() yields data as soon as it's available from upstream,
+                # which is essential for SSE streaming.
+                async for chunk in resp.content.iter_any():
+                    await response.write(chunk)
+                await response.write_eof()
         except Exception as e:
             _logger.error("Error during http forwarding. URL: %s. Error: %s.", url, e)
             if commit_on_error:
@@ -1035,22 +1015,15 @@ class GpuPriorityProxy:
 
         session = self._get_session(service_name)
         client_prepared = False
-        monitor_task = None
         url = url.rstrip("/") + path
         try:
             async with session.ws_connect(
                 url, headers=headers
             ) as ws_server:
-                try:
-                    await response.prepare(request)
-                    client_prepared = True
-                    monitor_task = asyncio.create_task(
-                        self._monitor_disconnection(request, service_name, ws_server.close)
-                    )
-                    await self._bidirectional_websocket_relay(response, ws_server)
-                finally:
-                    if monitor_task:
-                        monitor_task.cancel()
+                await response.prepare(request)
+                client_prepared = True
+                await self._bidirectional_websocket_relay(response, ws_server)
+                if not response.closed:
                     await response.close()
         except WSServerHandshakeError as e:
             if commit_on_error:
@@ -1060,7 +1033,9 @@ class GpuPriorityProxy:
             return False
         except Exception as e:
             _logger.error("Error during ws relay. URL: %s. Error: %s.", url, e)
-            if commit_on_error:
+            if client_prepared and not response.closed:
+                await response.close()
+            elif commit_on_error:
                 await self._fail_immediately(
                     request, response, _HTTP_SERVICE_UNAVAILABLE, str(e)
                 )
@@ -1070,7 +1045,7 @@ class GpuPriorityProxy:
         self,
         url: Optional[str],
         on_attempt: Optional[Callable[[], None]],
-        on_result: Optional[Callable[[bool, Optional[str]], None]],
+        on_result: Optional[Callable[[bool, Optional[str], bool], None]],
         forward: Callable[[str, bool], Awaitable[bool]],
         commit_on_error: bool,
         failure_action: str,
@@ -1081,7 +1056,7 @@ class GpuPriorityProxy:
         Args:
             url: The URL to forward to, or None to report failure without attempting.
             on_attempt: Called before the attempt starts.
-            on_result: Called with (result, err_msg) once the attempt settles.
+            on_result: Called with the result, error message, and cancelled flag once the attempt settles.
             forward: Performs the attempt, taking the URL and commit_on_error.
             commit_on_error: Whether forward may commit an error response.
             failure_action: Names the attempt in the failure message.
@@ -1092,9 +1067,7 @@ class GpuPriorityProxy:
             reported failure, or if forward raised an Exception.
 
         Raises:
-            asyncio.CancelledError: If the attempt is cancelled. Cancellation
-                derives from BaseException rather than Exception, so it is not
-                caught here and propagates out once on_result has run.
+            asyncio.CancelledError: If the attempt is cancelled.
         """
         if url is None:
             return False
@@ -1102,6 +1075,7 @@ class GpuPriorityProxy:
             on_attempt()
         result = False
         err_msg = None
+        is_cancelled = False
         try:
             result = await forward(url, commit_on_error)
             if result:
@@ -1112,13 +1086,21 @@ class GpuPriorityProxy:
                 )
                 _logger.error(err_msg)
                 return False
+        except asyncio.CancelledError:
+            is_cancelled = True
+            _logger.debug(
+                "Cancelled %s to endpoint %s.",
+                failure_action,
+                url + web_request.path,
+            )
+            raise
         except Exception as e:
             err_msg = str(e)
             _logger.error(err_msg)
             return False
         finally:
             if on_result:
-                on_result(result, err_msg)
+                on_result(result, err_msg, is_cancelled)
 
     async def _forward_ws(
         self,
@@ -1132,9 +1114,9 @@ class GpuPriorityProxy:
         target_url: Optional[str],
         backup_url: Optional[str] = None,
         on_target_attempt: Optional[Callable[[], None]] = None,
-        on_target_result: Optional[Callable[[bool, Optional[str]], None]] = None,
+        on_target_result: Optional[Callable[[bool, Optional[str], bool], None]] = None,
         on_backup_attempt: Optional[Callable[[], None]] = None,
-        on_backup_result: Optional[Callable[[bool, Optional[str]], None]] = None,
+        on_backup_result: Optional[Callable[[bool, Optional[str], bool], None]] = None,
         service_name: str = "",
         commit_on_error: bool = True,
     ) -> bool:
@@ -1173,7 +1155,7 @@ class GpuPriorityProxy:
             "relay websocket",
             web_request,
         )
-        if result:
+        if result or response.prepared:
             return result
         return await self._attempt_forward(
             backup_url,
@@ -1198,9 +1180,9 @@ class GpuPriorityProxy:
         target_url: Optional[str],
         backup_url: Optional[str] = None,
         on_target_attempt: Optional[Callable[[], None]] = None,
-        on_target_result: Optional[Callable[[bool, Optional[str]], None]] = None,
+        on_target_result: Optional[Callable[[bool, Optional[str], bool], None]] = None,
         on_backup_attempt: Optional[Callable[[], None]] = None,
-        on_backup_result: Optional[Callable[[bool, Optional[str]], None]] = None,
+        on_backup_result: Optional[Callable[[bool, Optional[str], bool], None]] = None,
         service_name: str = "",
         commit_on_error: bool = True,
     ) -> bool:
@@ -1240,7 +1222,7 @@ class GpuPriorityProxy:
             "forward http request",
             web_request,
         )
-        if result:
+        if result or response.prepared:
             return result
         return await self._attempt_forward(
             backup_url,
@@ -1277,10 +1259,12 @@ class GpuPriorityProxy:
                 on_target_attempt()
             self.routing_stats[service.name]["target"] += 1
 
-        def target_result(success: bool, err_msg: Optional[str]) -> None:
+        def target_result(
+            success: bool, err_msg: Optional[str], is_cancelled: bool
+        ) -> None:
             if on_target_result:
                 on_target_result(success)
-            if not success:
+            if not success and not is_cancelled:
                 self.eviction_log.append(
                     (
                         EvictionEventType.target_unreachable
@@ -1299,10 +1283,12 @@ class GpuPriorityProxy:
                 on_backup_attempt()
             self.routing_stats[service.name]["backup"] += 1
 
-        def backup_result(success: bool, err_msg: Optional[str]) -> None:
+        def backup_result(
+            success: bool, err_msg: Optional[str], is_cancelled: bool
+        ) -> None:
             if on_backup_result:
                 on_backup_result(success)
-            if not success:
+            if not success and not is_cancelled:
                 self.eviction_log.append(
                     (
                         EvictionEventType.backup_unreachable
@@ -1359,10 +1345,12 @@ class GpuPriorityProxy:
                 on_attempt()
             self.routing_stats[service.name]["backup"] += 1
 
-        def backup_result(success: bool, err_msg: Optional[str]) -> None:
+        def backup_result(
+            success: bool, err_msg: Optional[str], is_cancelled: bool
+        ) -> None:
             if on_result:
                 on_result(success)
-            if not success:
+            if not success and not is_cancelled:
                 self.eviction_log.append(
                     (
                         EvictionEventType.backup_unreachable
@@ -1407,9 +1395,9 @@ class GpuPriorityProxy:
         target_url: Optional[str],
         backup_url: Optional[str] = None,
         on_target_attempt: Optional[Callable[[], None]] = None,
-        on_target_result: Optional[Callable[[bool, Optional[str]], None]] = None,
+        on_target_result: Optional[Callable[[bool, Optional[str], bool], None]] = None,
         on_backup_attempt: Optional[Callable[[], None]] = None,
-        on_backup_result: Optional[Callable[[bool, Optional[str]], None]] = None,
+        on_backup_result: Optional[Callable[[bool, Optional[str], bool], None]] = None,
         service_name: str = "",
         commit_on_error: bool = True,
     ) -> bool:
@@ -1466,8 +1454,9 @@ class GpuPriorityProxy:
                 elif msg.type == WSMsgType.BINARY:
                     await ws_server.send_bytes(msg.data)
                 elif msg.type in (WSMsgType.ERROR, WSMsgType.CLOSE):
-                    await ws_server.close()
                     break
+            if not ws_server.closed:
+                await ws_server.close()
 
         async def backend_to_client() -> None:
             async for msg in ws_server:
@@ -1476,14 +1465,22 @@ class GpuPriorityProxy:
                 elif msg.type == WSMsgType.BINARY:
                     await ws_client.send_bytes(msg.data)
                 elif msg.type in (WSMsgType.ERROR, WSMsgType.CLOSE):
-                    await ws_client.close()
                     break
+            if not ws_client.closed:
+                await ws_client.close()
 
-        await asyncio.gather(
-            client_to_backend(),
-            backend_to_client(),
-            return_exceptions=True,
-        )
+        tasks = [
+            asyncio.create_task(client_to_backend()),
+            asyncio.create_task(backend_to_client()),
+        ]
+        try:
+            await asyncio.gather(*tasks)
+        except BaseException:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
 
     async def _evict_single_service(
         self,
