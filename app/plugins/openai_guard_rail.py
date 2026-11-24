@@ -428,6 +428,12 @@ class _StreamLoopDetector:
         return True
 
 
+def _is_sse_comment(raw_bytes: bytes) -> bool:
+    """Return True when raw_bytes contains only SSE comment lines."""
+    lines = [line for line in raw_bytes.splitlines() if line]
+    return bool(lines) and all(line.startswith(b":") for line in lines)
+
+
 async def _iter_openai_sse_events(
     chunks: AsyncIterator[bytes],
 ) -> AsyncIterator[tuple[dict | None, bytes]]:
@@ -644,6 +650,14 @@ class _DeltaSerializer:
         else:
             # Other types. Pass through as is.
             self._results.append((text, delta, raw_bytes))
+        self._flush()
+
+    def feed_passthrough(self, raw_bytes: bytes) -> None:
+        """Keep raw bytes in order without flushing a pending tool call."""
+        if "text" in self._pending_tool_call_delta:
+            self._pending_tool_call_bytes.extend(raw_bytes)
+            return
+        self._results.append(("", {}, raw_bytes))
         self._flush()
 
     def poll(self) -> list[tuple[str, dict, bytes]]:
@@ -963,12 +977,13 @@ class _Session:
         if not self.prepared:
             return
 
-        if not self.is_ok:
-            # Pass through error message.
+        if not self.is_ok or _is_sse_comment(raw_bytes):
             self._approve(raw_bytes)
         elif not updates:
-            # Go through serializer for processing in-place.
-            self._delta_serializer.feed({}, raw_bytes)
+            if self._upstream_streaming:
+                self._delta_serializer.feed_passthrough(raw_bytes)
+            else:
+                self._delta_serializer.feed({}, raw_bytes)
         else:
             for index, update in enumerate(updates):
                 self._delta_serializer.feed(update, raw_bytes if index == raw_bytes_owner_index else b"")

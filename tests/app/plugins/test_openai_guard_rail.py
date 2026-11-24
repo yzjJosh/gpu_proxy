@@ -15,6 +15,7 @@ import pytest
 from tests.app.conftest import (
     CHAT_WIRE,
     RESPONSES_WIRE,
+    ResponsesStream,
     Wire,
     parse_sse_payloads,
     responses_request,
@@ -341,6 +342,31 @@ def _repeat_history_tool_call_reply(name: str, arguments: str) -> bytes:
         The scripted reply.
     """
     return sse_tool_call("tc2", name, json.loads(arguments)) + sse_done()
+
+
+_KEEPALIVE_COMMENT = b": keep-alive\n\n"
+
+
+def _build_tool_call_delta(
+    arguments: str,
+    name: str = "",
+    tool_call_id: str = "",
+    index: int = 0,
+    chat_id: str = "1",
+) -> bytes:
+    """Build one SSE event carrying a tool call delta."""
+    function: dict[str, str] = {"arguments": arguments}
+    if name:
+        function["name"] = name
+    tool_call: dict[str, int | str | dict[str, str]] = {"index": index, "function": function}
+    if tool_call_id:
+        tool_call["id"] = tool_call_id
+        tool_call["type"] = "function"
+    return sse_event({"id": chat_id, "choices": [{"delta": {"tool_calls": [tool_call]}}]})
+
+
+_SPLIT_TOOL_CALL_OPENING = _build_tool_call_delta('{"tasks":', name="delegate_task", tool_call_id="tc1")
+_SPLIT_TOOL_CALL_CLOSING = _build_tool_call_delta('["a"]}')
 
 
 def _loop_upstream() -> _Upstream:
@@ -1320,6 +1346,161 @@ class TestStreamValidationAndRetry:
 
         await _drive_result(plugin, upstream.forward, client)
         assert upstream.calls == 1
+
+    @pytest.mark.parametrize(
+        ("filler", "flushes_immediately"),
+        [
+            pytest.param(_KEEPALIVE_COMMENT, True, id="sse-comment"),
+            pytest.param(_build_tool_call_delta(""), False, id="empty-tool-args-delta"),
+            pytest.param(sse_event({"id": "1", "choices": [{"delta": {}}]}), False, id="empty-delta"),
+        ],
+    )
+    async def test_validate_tool_calls_ignores_keepalive_and_empty_events_mid_tool_call(
+        self, filler: bytes, flushes_immediately: bool
+    ) -> None:
+        """Keepalive comments and empty deltas between argument chunks do not break a tool call."""
+        plugin = OpenAIGuardRail({"validate_tool_calls": True})
+        client = _make_client_response()
+        upstream = _Upstream(
+            _SPLIT_TOOL_CALL_OPENING
+            + filler
+            + _SPLIT_TOOL_CALL_CLOSING
+            + sse_finish_reason("1", "tool_calls")
+            + sse_done()
+        )
+
+        written = await _drive(plugin, upstream.forward, client, STREAM_REQUEST)
+
+        assert upstream.calls == 1
+        assert filler in written
+        assert extract_sse_tool_call_name(written) == "delegate_task"
+        assert extract_sse_tool_call_args(written) == {"tasks": ["a"]}
+        opening_pos = written.index(_SPLIT_TOOL_CALL_OPENING)
+        filler_pos = written.index(filler)
+        closing_pos = written.index(_SPLIT_TOOL_CALL_CLOSING)
+        if flushes_immediately:
+            assert filler_pos < opening_pos < closing_pos
+        else:
+            assert opening_pos < filler_pos < closing_pos
+
+    async def test_validate_tool_calls_flushes_keepalive_before_tool_call_completes(self) -> None:
+        """A keepalive comment reaches a streaming client before the buffered tool call finishes."""
+        plugin = OpenAIGuardRail({"validate_tool_calls": True})
+        client = _make_client_response()
+        keepalive_written = asyncio.Event()
+        mid_stream_bytes = b""
+
+        async def record_write(chunk: bytes) -> None:
+            if chunk:
+                keepalive_written.set()
+
+        client.write = AsyncMock(side_effect=record_write)
+
+        async def slow_upstream(
+            _headers: dict[str, str],
+            _body: bytes,
+            _path: str,
+            web_req: web.Request,
+            resp: AbstractMutatingResponse,
+        ) -> bool:
+            nonlocal mid_stream_bytes
+            await resp.prepare(web_req)
+            await resp.write(_SPLIT_TOOL_CALL_OPENING + _KEEPALIVE_COMMENT)
+            await asyncio.wait_for(keepalive_written.wait(), timeout=1.0)
+            mid_stream_bytes = _written(client)
+            await resp.write(_SPLIT_TOOL_CALL_CLOSING + sse_finish_reason("1", "tool_calls") + sse_done())
+            await resp.write_eof()
+            return True
+
+        written = await _drive(plugin, slow_upstream, client, STREAM_REQUEST)
+
+        assert mid_stream_bytes == _KEEPALIVE_COMMENT
+        assert extract_sse_tool_call_name(written) == "delegate_task"
+        assert extract_sse_tool_call_args(written) == {"tasks": ["a"]}
+
+    async def test_validate_tool_calls_keepalive_mid_tool_call_non_streaming(self) -> None:
+        """A keepalive comment mid tool call still assembles a valid non streaming reply."""
+        plugin = OpenAIGuardRail({"validate_tool_calls": True})
+        client = _make_client_response()
+        upstream = _Upstream(
+            _SPLIT_TOOL_CALL_OPENING
+            + _KEEPALIVE_COMMENT
+            + _SPLIT_TOOL_CALL_CLOSING
+            + sse_finish_reason("1", "tool_calls")
+            + sse_done()
+        )
+
+        written = await _drive(plugin, upstream.forward, client, NON_STREAM_REQUEST)
+
+        assert upstream.calls == 1
+        data = json.loads(written)
+        tool_call = data["choices"][0]["message"]["tool_calls"][0]
+        assert tool_call["function"]["name"] == "delegate_task"
+        assert json.loads(tool_call["function"]["arguments"]) == {"tasks": ["a"]}
+
+    async def test_validate_tool_calls_keepalive_mid_responses_tool_call(self) -> None:
+        """A keepalive comment between Responses tool call deltas does not trigger a retry."""
+        plugin = OpenAIGuardRail({"validate_tool_calls": True})
+        stream = ResponsesStream("resp_1")
+        body = (
+            stream.start()
+            + stream.tool_call_opening("tc1", "delegate_task")
+            + sse_event({"type": "response.function_call_arguments.delta", "item_id": "fc_tc1", "delta": '{"tasks":'})
+            + _KEEPALIVE_COMMENT
+            + sse_event({"type": "response.function_call_arguments.delta", "item_id": "fc_tc1", "delta": '["a"]}'})
+            + sse_event({"type": "response.function_call_arguments.done", "item_id": "fc_tc1", "name": "delegate_task", "arguments": '{"tasks":["a"]}'})
+            + stream.completed()
+        )
+        upstream = _Upstream(body)
+
+        written, _ = await _drive_wire(plugin, RESPONSES_WIRE, upstream, _first_turn(RESPONSES_WIRE))
+
+        assert upstream.calls == 1
+        assert _KEEPALIVE_COMMENT in written
+        assert written.index(_KEEPALIVE_COMMENT) < written.index(b'"response.function_call_arguments.delta"')
+        payloads = parse_sse_payloads(written)
+        deltas = [p["delta"] for p in payloads if p.get("type") == "response.function_call_arguments.delta"]
+        assert "".join(deltas) == '{"tasks":["a"]}'
+        done_events = [p for p in payloads if p.get("type") == "response.function_call_arguments.done"]
+        assert len(done_events) == 1
+        assert done_events[0]["name"] == "delegate_task"
+        assert json.loads(done_events[0]["arguments"]) == {"tasks": ["a"]}
+        completed_events = [p for p in payloads if p.get("type") == "response.completed"]
+        assert len(completed_events) == 1
+        assert completed_events[0]["response"]["id"] == "resp_1"
+        assert completed_events[0]["response"]["status"] == "completed"
+
+    async def test_validate_tool_calls_keepalive_still_catches_broken_json(self) -> None:
+        """A keepalive comment does not hide truly invalid tool call JSON."""
+        plugin = OpenAIGuardRail({"validate_tool_calls": True})
+        client = _make_client_response()
+        upstream = _Upstream(
+            _SPLIT_TOOL_CALL_OPENING
+            + _KEEPALIVE_COMMENT
+            + _build_tool_call_delta("not-json")
+            + sse_finish_reason("1", "tool_calls")
+            + sse_done(),
+            _recovered_reply(finish_reason="stop"),
+        )
+
+        await _drive_result(plugin, upstream.forward, client, STREAM_REQUEST)
+
+        assert upstream.calls == 2
+        assert "invalid JSON arguments" in _forwarded_system_message(upstream)
+
+    async def test_force_final_output_retries_when_stream_has_only_keepalive(self) -> None:
+        """A stream with only a keepalive comment and no output still triggers a retry."""
+        plugin = OpenAIGuardRail({"force_final_output": True})
+        client = _make_client_response()
+        upstream = _Upstream(
+            _KEEPALIVE_COMMENT + sse_done(),
+            _recovered_reply(finish_reason="stop"),
+        )
+
+        written = await _drive(plugin, upstream.forward, client, STREAM_REQUEST)
+
+        assert upstream.calls == 2
+        assert extract_sse_field(written) == "recovered"
 
     async def test_dedup_tool_call_from_same_turn_history_triggers_retry(self) -> None:
         """Tool call from current turn history repeated in new response triggers retry."""
