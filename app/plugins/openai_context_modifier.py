@@ -364,7 +364,7 @@ def _prune_tool_calls_amortized(
     unpruned_turns = total_turns - state.pruned_up_to_turn
     max_window = int(total_turns * max_window_ratio) + min_window
 
-    if unpruned_turns >= max_window:
+    if unpruned_turns > max_window:
         prune_threshold = min_window
     else:
         prune_threshold = total_turns - state.pruned_up_to_turn

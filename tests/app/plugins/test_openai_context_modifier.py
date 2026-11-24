@@ -556,6 +556,7 @@ def _prune_zone_history(arguments: str) -> list[_Message]:
         _tool_result("t1", "old result"),
         _user("f1"),
         _user("f2"),
+        _user("f3"),
         _user("end"),
     ]
 
@@ -834,6 +835,25 @@ class TestAmortizedToolCallsBasic:
         messages = await _rewritten_messages(plugin, history)
         kept = [_long_result(i) for i in range(14, 23)]
         assert _tool_contents(messages) == [PRUNED] * 13 + kept
+
+    async def test_does_not_prune_when_unpruned_equals_max_window(self) -> None:
+        """Keep full tool results while unpruned turns equal max_window, then prune once."""
+        plugin = OpenAIContextModifier({
+            "preserve_tool_calls_min_window_size": 5,
+            "preserve_tool_calls_max_window_size_ratio": HALF_RATIO,
+        })
+
+        at_nine = await _rewritten_messages(plugin, [_system()] + _tool_turns(9))
+        assert _tool_contents(at_nine) == [_long_result(i) for i in range(1, 10)]
+
+        at_ten = await _rewritten_messages(plugin, [_system()] + _tool_turns(10))
+        assert _tool_contents(at_ten) == [_long_result(i) for i in range(1, 11)]
+
+        at_eleven = await _rewritten_messages(plugin, [_system()] + _tool_turns(11))
+        assert _tool_contents(at_eleven) == [PRUNED] * 6 + [_long_result(i) for i in range(7, 12)]
+
+        at_twelve = await _rewritten_messages(plugin, [_system()] + _tool_turns(12))
+        assert _tool_contents(at_twelve) == [PRUNED] * 6 + [_long_result(i) for i in range(7, 13)]
 
 
 class TestAmortizedToolCallsDisabled:
@@ -1379,6 +1399,8 @@ class TestOpenAIContextModifier:
             _tool_result("tc1", LONG_TOOL_RESULT),
             _tool_result("tc2", LONG_TOOL_RESULT),
             _user("Turn 2"),
+            _assistant("mid"),
+            _user("Turn 3"),
             _assistant_calling(_tool_call("tc3", arguments='{"q":"foo"}'), content="b"),
             _tool_result("tc3", LONG_TOOL_RESULT),
         ]
