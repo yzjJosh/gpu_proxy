@@ -956,7 +956,7 @@ class GpuPriorityProxy:
                         continue
                     response.headers[key] = val
 
-                if resp.status != _HTTP_OK:
+                if resp.status >= _HTTP_INTERNAL_SERVER_ERROR:
                     payload = await resp.read()
                     resp.close()
                     if commit_on_error:

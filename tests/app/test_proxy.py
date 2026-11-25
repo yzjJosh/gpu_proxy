@@ -70,8 +70,10 @@ HTTP_SWITCHING_PROTOCOLS = 101
 HTTP_OK = 200
 HTTP_CREATED = 201
 HTTP_FOUND = 302
+HTTP_BAD_REQUEST = 400
 HTTP_NOT_FOUND = 404
 HTTP_METHOD_NOT_ALLOWED = 405
+HTTP_CONTENT_TOO_LARGE = 413
 HTTP_INTERNAL_SERVER_ERROR = 500
 HTTP_BAD_GATEWAY = 502
 HTTP_SERVICE_UNAVAILABLE = 503
@@ -1197,13 +1199,20 @@ class TestPassthroughForwarding:
 
     @pytest.mark.parametrize(
         "status",
-        [HTTP_CREATED, HTTP_FOUND, HTTP_NOT_FOUND, HTTP_INTERNAL_SERVER_ERROR],
+        [
+            HTTP_INTERNAL_SERVER_ERROR,
+            HTTP_BAD_GATEWAY,
+            HTTP_SERVICE_UNAVAILABLE,
+        ],
     )
-    async def test_target_status_other_than_200_falls_back_to_backup(
-        self, gpu_service: ProxyHarness, target: UpstreamServer, backup: UpstreamServer,
+    async def test_target_5xx_falls_back_to_backup_and_logs_target_failed(
+        self,
+        gpu_service: ProxyHarness,
+        target: UpstreamServer,
+        backup: UpstreamServer,
         status: int,
     ) -> None:
-        """Anything but 200 from the target counts as a failure worth retrying."""
+        """A 5xx response from the target retries on the backup and logs a failure event."""
         target.status = status
         backup.body = b"backup-recovered"
         reply = await gpu_service.send("/v1/models", "svc.local")
@@ -1211,6 +1220,36 @@ class TestPassthroughForwarding:
         assert reply.text == "backup-recovered"
         assert len(target.requests) == 1
         assert len(backup.requests) == 1
+        events = await gpu_service.events("target_failed", "svc")
+        assert [e["event"] for e in events] == ["target_failed"]
+
+    @pytest.mark.parametrize(
+        "status",
+        [
+            HTTP_CREATED,
+            HTTP_FOUND,
+            HTTP_BAD_REQUEST,
+            HTTP_NOT_FOUND,
+            HTTP_CONTENT_TOO_LARGE,
+        ],
+    )
+    async def test_target_non_5xx_status_returns_directly_without_failure_event(
+        self,
+        gpu_service: ProxyHarness,
+        target: UpstreamServer,
+        backup: UpstreamServer,
+        status: int,
+    ) -> None:
+        """A 2xx, 3xx, or 4xx response from the target is returned as normal."""
+        target.status = status
+        target.body = b"target-response"
+        backup.body = b"should-not-be-used"
+        reply = await gpu_service.send("/v1/models", "svc.local")
+        assert reply.status == status
+        assert reply.text == "target-response"
+        assert len(target.requests) == 1
+        assert len(backup.requests) == 0
+        assert await gpu_service.events("target_failed", "svc") == []
 
     async def test_backup_error_reaches_the_client(
         self, gpu_service: ProxyHarness, target: UpstreamServer, backup: UpstreamServer
@@ -1222,19 +1261,50 @@ class TestPassthroughForwarding:
         reply = await gpu_service.send("/v1/models", "svc.local")
         assert reply.status == HTTP_SERVICE_UNAVAILABLE
         assert reply.text == "backup is down too"
+        assert [e["event"] for e in await gpu_service.events("target_failed", "svc")] == [
+            "target_failed"
+        ]
+        assert [e["event"] for e in await gpu_service.events("backup_failed", "svc")] == [
+            "backup_failed"
+        ]
 
-    async def test_target_error_reaches_the_client_without_a_backup(
-        self, start_proxy: StartProxy, target: UpstreamServer
+    async def test_backup_4xx_does_not_log_backup_failed(
+        self, gpu_service: ProxyHarness, target: UpstreamServer, backup: UpstreamServer
     ) -> None:
-        """Without a backup the target's own error is relayed."""
-        target.status = HTTP_INTERNAL_SERVER_ERROR
+        """A 4xx response from the backup is returned as normal."""
+        target.status = HTTP_BAD_GATEWAY
+        backup.status = HTTP_BAD_REQUEST
+        backup.body = b"invalid payload"
+        reply = await gpu_service.send("/v1/models", "svc.local")
+        assert reply.status == HTTP_BAD_REQUEST
+        assert reply.text == "invalid payload"
+        assert [e["event"] for e in await gpu_service.events("target_failed", "svc")] == [
+            "target_failed"
+        ]
+        assert await gpu_service.events("backup_failed", "svc") == []
+
+    @pytest.mark.parametrize(
+        "status",
+        [
+            HTTP_INTERNAL_SERVER_ERROR,
+            HTTP_BAD_GATEWAY,
+            HTTP_SERVICE_UNAVAILABLE,
+        ],
+    )
+    async def test_target_5xx_without_backup_reaches_client_and_logs_target_failed(
+        self, start_proxy: StartProxy, target: UpstreamServer, status: int
+    ) -> None:
+        """Without a backup, a 5xx response is relayed and logged as target failed."""
+        target.status = status
         target.body = b"upstream exploded"
         harness = await start_proxy(
             make_config([make_service("svc", target.url)], free_port())
         )
         reply = await harness.send("/v1/models", "svc.local")
-        assert reply.status == HTTP_INTERNAL_SERVER_ERROR
+        assert reply.status == status
         assert reply.text == "upstream exploded"
+        events = await harness.events("target_failed", "svc")
+        assert [e["event"] for e in events] == ["target_failed"]
 
     async def test_both_upstreams_unreachable_returns_503(
         self, start_proxy: StartProxy
