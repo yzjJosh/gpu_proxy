@@ -1,0 +1,11 @@
+[package]
+name = "gpu-proxy-loop-detector"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "gpu_proxy_loop_detector"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = { version = "0.30.1" }

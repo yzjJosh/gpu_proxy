@@ -1,0 +1,12 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "gpu-proxy-loop-detector"
+version = "0.1.0"
+requires-python = ">=3.12"
+
+[tool.maturin]
+module-name = "gpu_proxy_loop_detector"
+features = ["pyo3/extension-module"]

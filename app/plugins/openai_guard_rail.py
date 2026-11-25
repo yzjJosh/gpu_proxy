@@ -12,6 +12,7 @@ from app.config import ConfigError, ServiceConfig
 from app.responses import AbstractMutatingResponse, CaptureResponse
 
 import aiohttp.web as web
+import gpu_proxy_loop_detector
 
 from app.plugins.base import PluginBase
 from app.plugins.openai_api_formats.base import (
@@ -29,9 +30,8 @@ from app.plugins.utils import (
 )
 
 _TOOL_CALL_HASH_MIN_LENGTH = 32
+_DEFAULT_MIN_LOOP_DISTANCE = 50
 _DEDUP_EXCLUSION_EXTRA_KEYS: frozenset[str] = frozenset({"max_dup_exclusion_count"})
-_FINGERPRINT_MODULUS = (1 << 61) - 1
-_FINGERPRINT_BASE = 1_000_003
 _RESUMPTION_LRU_SIZE = 50
 
 _CHAT_API_FORMAT = ChatCompletionsAPIFormat()
@@ -254,6 +254,15 @@ class _DedupExclusion:
     max_dup_exclusion_count: int | None
 
 
+def _parse_min_loop_distance(config: dict) -> int:
+    value = config.get("min_loop_distance", _DEFAULT_MIN_LOOP_DISTANCE)
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise ConfigError(
+            f"OpenAIGuardRail: min_loop_distance must be an integer >= 1, got {value!r}"
+        )
+    return value
+
+
 def _parse_max_dup_exclusion_count(entry: dict, index: int) -> int | None:
     if "max_dup_exclusion_count" not in entry:
         return None
@@ -402,154 +411,63 @@ class _ToolCallDupDetector:
 
 
 class _StreamLoopDetector:
-    """Detects when a streaming text output enters a repetition loop.
+    """Detect when streamed text enters a repetition loop."""
 
-    Uses a sliding-window hash to find blocks that repeat at a fixed period.
-    Once a loop is confirmed (hash match + string verification), returns True
-    so the caller can abort the stream.
-    """
-
-    def __init__(self, min_block_size: int = 50, loop_free_history: str = "") -> None:
-        """Create a detector that already holds some history.
+    def __init__(
+        self,
+        min_block_size: int = _DEFAULT_MIN_LOOP_DISTANCE,
+        native_detector: gpu_proxy_loop_detector.StreamLoopDetector | None = None,
+    ) -> None:
+        """Create a loop detector.
 
         Args:
-            min_block_size: The shortest block that counts as a repeat.
-            loop_free_history: Text already known to hold no loop, recorded without checking.
+            min_block_size: Shortest block length that counts as a repeat.
+            native_detector: Prebuilt detector instance to wrap.
         """
-        self.buffer = ""
-        self.min_block_size = min_block_size
-        # Each entry records where a matching window ends.
-        self.seen_hashes: dict[int, int | list[int]] = {}
-        self._last_start_idx = 0
-        self._positions_recorded_by_latest_feed = range(0)
-        self._running_fingerprints = [0]
-        self._powers_of_base = [1]
-        # The history is not a feed, so pop_last cannot undo it.
-        self._append_to_buffer(loop_free_history)
-        for position in self._positions_after(0):
-            self._remember_window_ending_at(position, self._hash_of_window_ending_at(position))
+        self._native: gpu_proxy_loop_detector.StreamLoopDetector = (
+            native_detector
+            if native_detector is not None
+            else gpu_proxy_loop_detector.StreamLoopDetector(min_block_size)
+        )
+
+    @classmethod
+    def from_history(
+        cls,
+        history: str,
+        min_block_size: int = _DEFAULT_MIN_LOOP_DISTANCE,
+    ) -> Self:
+        """Create a detector primed with the trailing part of history after any prior repeat.
+
+        Args:
+            history: Serialized assistant text from earlier turns.
+            min_block_size: Shortest block length that counts as a repeat.
+
+        Returns:
+            A detector holding the trailing part of history after any prior repeat.
+        """
+        native = gpu_proxy_loop_detector.StreamLoopDetector.from_history(
+            history, min_block_size
+        )
+        return cls(native_detector=native)
 
     def feed(self, delta: str) -> bool:
-        """Feed a chunk of text into the detector.
-
-        Appends *delta* to the internal buffer and checks for repetition loops
-        using a sliding-window hash. If a loop is detected, returns ``True``
-        without undoing the feed — call ``pop_last()`` to revert if needed.
+        """Append delta and return True when it closes a repetition loop.
 
         Args:
             delta: New text chunk from the stream.
 
         Returns:
-            ``True`` if a repetition loop is detected, ``False`` otherwise.
+            True if a repetition loop is detected, False otherwise.
         """
-        if not delta:
-            return False
-        old_length = len(self.buffer)
-        self._last_start_idx = old_length
-        self._append_to_buffer(delta)
-        new_positions = self._positions_after(old_length)
-        for position in new_positions:
-            window_hash = self._hash_of_window_ending_at(position)
-            is_seen_window = window_hash in self.seen_hashes
-            if is_seen_window and self._loop_ends_at(position, window_hash):
-                self._positions_recorded_by_latest_feed = range(new_positions.start, position)
-                return True
-            self._remember_window_ending_at(position, window_hash)
-        self._positions_recorded_by_latest_feed = new_positions
-        return False
-
-    def _append_to_buffer(self, text: str) -> None:
-        """Add text to the end of the buffer."""
-        self.buffer += text
-        for char in text:
-            next_fingerprint = self._running_fingerprints[-1] * _FINGERPRINT_BASE + ord(char)
-            self._running_fingerprints.append(next_fingerprint % _FINGERPRINT_MODULUS)
-            next_power = self._powers_of_base[-1] * _FINGERPRINT_BASE
-            self._powers_of_base.append(next_power % _FINGERPRINT_MODULUS)
-
-    def _positions_after(self, start: int) -> range:
-        """Buffer positions after start that have a full window of min_block_size characters before them."""
-        return range(max(self.min_block_size, start + 1), len(self.buffer) + 1)
-
-    def _hash_of_window_ending_at(self, position: int) -> int:
-        """The hash of the min_block_size characters right before position."""
-        return hash(self.buffer[position - self.min_block_size : position])
-
-    def _loop_ends_at(self, position: int, window_hash: int) -> bool:
-        """Whether a long enough block repeats twice in a row right before position, for a seen window."""
-        for earlier_position in self._newest_first(self.seen_hashes[window_hash]):
-            if 2 * earlier_position < position:
-                # This position and every older one are too far back for the block to fit twice.
-                break
-            block_length = position - earlier_position
-            if block_length < self.min_block_size:
-                continue
-            if self._block_repeats_twice_before(position, block_length):
-                return True
-        return False
-
-    @staticmethod
-    def _newest_first(positions: int | list[int]) -> Iterable[int]:
-        """The positions stored for one window hash, newest first."""
-        if isinstance(positions, int):
-            return (positions,)
-        return reversed(positions)
-
-    def _remember_window_ending_at(self, position: int, window_hash: int) -> None:
-        """Remember that a window with this hash ends at position."""
-        positions = self.seen_hashes.get(window_hash)
-        if positions is None:
-            self.seen_hashes[window_hash] = position
-        elif isinstance(positions, int):
-            self.seen_hashes[window_hash] = [positions, position]
-        else:
-            positions.append(position)
-
-    def _forget_window_ending_at(self, position: int) -> None:
-        """Forget the window that ends at position, which must be the newest one with its hash."""
-        window_hash = self._hash_of_window_ending_at(position)
-        positions = self.seen_hashes[window_hash]
-        if isinstance(positions, list) and len(positions) > 1:
-            positions.pop()
-        else:
-            del self.seen_hashes[window_hash]
-
-    def _fingerprint_of_buffer_between(self, start: int, end: int) -> int:
-        """Return the fingerprint of the selected text."""
-        shift = self._powers_of_base[end - start]
-        fingerprint = self._running_fingerprints[end] - self._running_fingerprints[start] * shift
-        return fingerprint % _FINGERPRINT_MODULUS
-
-    def _block_repeats_twice_before(self, position: int, block_length: int) -> bool:
-        """Whether the last block_length characters before position appear twice in a row."""
-        middle = position - block_length
-        start = middle - block_length
-        first_fingerprint = self._fingerprint_of_buffer_between(start, middle)
-        second_fingerprint = self._fingerprint_of_buffer_between(middle, position)
-        if first_fingerprint != second_fingerprint:
-            return False
-        return self.buffer[start:middle] == self.buffer[middle:position]
+        return self._native.feed(delta)
 
     def pop_last(self) -> bool:
-        """Undo the most recent successful ``feed()`` call.
-
-        Restores the buffer and hash state to what they were before the
-        last ``feed()``. Only the most recent feed can be undone — earlier
-        feeds cannot be recovered.
+        """Undo the most recent feed call.
 
         Returns:
-            ``True`` if a feed was undone, ``False`` if there was nothing to undo
-            (no prior feed, or previous undo already consumed the state).
+            True if a feed was undone, False if there was nothing to undo.
         """
-        if not self._positions_recorded_by_latest_feed:
-            return False
-        for position in reversed(self._positions_recorded_by_latest_feed):
-            self._forget_window_ending_at(position)
-        self.buffer = self.buffer[: self._last_start_idx]
-        del self._running_fingerprints[self._last_start_idx + 1 :]
-        del self._powers_of_base[self._last_start_idx + 1 :]
-        self._positions_recorded_by_latest_feed = range(0)
-        return True
+        return self._native.pop_last()
 
 
 def _is_sse_comment(raw_bytes: bytes) -> bool:
@@ -641,35 +559,6 @@ def _read_request_history[V](data: dict[str, V], api_format: ConversationAPIForm
     if message_history is not None:
         return message_history.messages
     return api_format.get_raw_history_field(data)
-
-
-def _safe_suffix_start(text: str, min_block_size: int, chunk_size: int) -> int:
-    """Find where the longest loop-free trailing slice of text begins.
-
-    Scans text backwards a chunk at a time with a throwaway detector and stops
-    at the first chunk that closes a repetition loop, so history already stuck
-    in a loop does not prime the permanent detector into firing immediately.
-
-    Args:
-        text: The serialized history to scan.
-        min_block_size: Repetition block size the throwaway detector looks for.
-        chunk_size: How much reversed text to feed per step.
-
-    Returns:
-        Index into text where the loop-free suffix starts; len(text) if none is.
-    """
-    temp = _StreamLoopDetector(min_block_size=min_block_size)
-    safe_end_in_reversed = 0
-    pos = 0
-    reversed_text = text[::-1]
-    while pos < len(reversed_text):
-        end = min(pos + chunk_size, len(reversed_text))
-        if temp.feed(reversed_text[pos:end]):
-            temp.pop_last()
-            break
-        safe_end_in_reversed = end
-        pos = end
-    return len(text) - safe_end_in_reversed
 
 
 def _normalize_tc_id(tc_id: str) -> str:
@@ -993,20 +882,16 @@ class _Session:
                     self._tool_call_dup_detector.record(hashed.compact_digest)
 
     def _init_loop_history(self, chat_history: str) -> None:
-        """Initialize loop detector with non-looping assistant history suffix.
+        """Record the trailing part of history after any prior repeat in the loop detector.
 
-        Flattens assistant role content, feeds it backwards with a temporary
-        detector to find the longest non-looping suffix, then feeds that suffix
-        forward into the permanent detector.
+        Args:
+            chat_history: Serialized assistant text from earlier turns.
         """
         if not chat_history:
             return
-
-        min_bs = self.min_loop_distance
-        safe_start = _safe_suffix_start(chat_history, min_bs, min_bs)
-        if safe_start < len(chat_history):
-            suffix = chat_history[safe_start:]
-            self._loop_detector.feed(suffix)
+        self._loop_detector = _StreamLoopDetector.from_history(
+            chat_history, min_block_size=self.min_loop_distance
+        )
 
     @staticmethod
     def _build_tool_call_hint(tc_text: str) -> str:
@@ -1257,6 +1142,7 @@ class OpenAIGuardRail(PluginBase):
         super().__init__(config, service_config)
         self._resumption_state: _LRUOrderedDict = _LRUOrderedDict()
         self._telemetry: _Telemetry = _Telemetry()
+        self._min_loop_distance: int = _parse_min_loop_distance(config)
         self._dedup_exclusions: list[_DedupExclusion] = _parse_dedup_exclusions(
             config.get("tool_call_dedup_exclusions", [])
         )
@@ -1582,7 +1468,7 @@ class OpenAIGuardRail(PluginBase):
             is_streaming,
             self.config.get("max_retry_attempt", 2),
             self.config.get("break_loops", False),
-            self.config.get("min_loop_distance", 50),
+            self._min_loop_distance,
             self.config.get("force_final_output", False),
             self.config.get("dedup_tool_calls", False),
             self.config.get("validate_tool_calls", False),

@@ -87,6 +87,13 @@ npm install   # first time only
 npm run build # outputs to dashboard/dist/
 ```
 
+**Rust loop detector extension** (`rust/loop_detector/`, PyO3 + maturin): `OpenAIGuardRail` requires the compiled `gpu_proxy_loop_detector` module installed in `/var/gpu_proxy/venv`. After changing Rust source or upgrading the venv Python minor version, rebuild and install it:
+```bash
+venv/bin/pip install maturin                                                                       # first time only
+VIRTUAL_ENV=/var/gpu_proxy/venv venv/bin/maturin develop --release --manifest-path rust/loop_detector/Cargo.toml
+cargo test --manifest-path rust/loop_detector/Cargo.toml                                           # Rust unit & oracle tests
+```
+
 ## Code Standards
 
 Refer to the **code-standard** skill for the full set of coding conventions and rules. The skill must be loaded before writing any new code.

@@ -6,3 +6,4 @@ venv
 .worktrees/
 /config.yaml
 /docs/
+rust/loop_detector/target/

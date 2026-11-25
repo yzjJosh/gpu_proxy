@@ -3824,3 +3824,99 @@ class TestLongHistoryLatency:
             child.join()
         assert upstream_calls == 1
         assert elapsed <= _ANSWER_BUDGET_S, f"the guard rail took {elapsed:.2f}s on a request with {size}"
+
+
+_UNICODE_BOUNDARY_CODE_POINTS = 10
+_UNICODE_LARGER_MIN_DISTANCE = 15
+_SMALL_LOOP_BLOCK_SIZE = 5
+_FIRST_CHAR_TRIGGER_BLOCK_SIZE = 50
+_FIRST_CHAR_TRIGGER_PREFIX_COUNT = 99
+
+
+class TestLoopDetectorBoundaryBehavior:
+    @pytest.mark.parametrize(
+        "config",
+        [
+            pytest.param({"min_loop_distance": 0}, id="zero"),
+            pytest.param({"min_loop_distance": -1}, id="negative"),
+            pytest.param({"min_loop_distance": True}, id="bool-true"),
+            pytest.param({"min_loop_distance": False}, id="bool-false"),
+            pytest.param({"min_loop_distance": "50"}, id="string"),
+            pytest.param({"min_loop_distance": 1.5}, id="float"),
+            pytest.param({"min_loop_distance": None}, id="none"),
+        ],
+    )
+    def test_invalid_min_loop_distance_raises_config_error(self, config: dict) -> None:
+        """Invalid min_loop_distance values fail fast with ConfigError at startup."""
+        with pytest.raises(ConfigError, match="OpenAIGuardRail: min_loop_distance"):
+            OpenAIGuardRail(config)
+
+    async def test_unicode_min_loop_distance_counts_code_points_not_utf8_bytes(self) -> None:
+        """Multi-byte Unicode repeats are measured in code points rather than UTF-8 bytes."""
+        # Each arrow is 3 UTF-8 bytes, so 10 arrows are 30 bytes but only 10 code points.
+        arrow_block = "→" * _UNICODE_BOUNDARY_CODE_POINTS
+        stream = sse_content("1", arrow_block) + sse_content("1", arrow_block) + sse_done()
+
+        no_loop_plugin = OpenAIGuardRail(
+            {"break_loops": True, "min_loop_distance": _UNICODE_LARGER_MIN_DISTANCE}
+        )
+        no_loop_upstream = _Upstream(stream)
+        await _drive_result(no_loop_plugin, no_loop_upstream.forward, _make_client_response())
+        assert no_loop_upstream.calls == 1
+
+        loop_plugin = OpenAIGuardRail(
+            {"break_loops": True, "min_loop_distance": _UNICODE_BOUNDARY_CODE_POINTS}
+        )
+        loop_upstream = _Upstream(stream, _recovered_reply())
+        await _drive_result(loop_plugin, loop_upstream.forward, _make_client_response())
+        assert loop_upstream.calls == 2
+
+    async def test_unpaired_surrogate_in_history_and_stream_does_not_crash(self) -> None:
+        """Unpaired UTF-16 surrogates in history and streamed chunks do not raise encoding errors."""
+        plugin = OpenAIGuardRail(
+            {"break_loops": True, "min_loop_distance": _UNICODE_BOUNDARY_CODE_POINTS}
+        )
+        history_text = "prefix_\ud800_history_"
+        repeated_block = "loop_\ud800_unit_"
+        upstream = _Upstream(
+            sse_content("1", repeated_block) + sse_content("1", repeated_block) + sse_done(),
+            _recovered_reply(),
+        )
+        written = await _drive(
+            plugin,
+            upstream.forward,
+            _make_client_response(),
+            _request([_assistant_message(history_text)]),
+        )
+        assert upstream.calls == 2
+        assert extract_sse_field(written).endswith("recovered")
+
+    @pytest.mark.parametrize("min_distance", [1, _SMALL_LOOP_BLOCK_SIZE])
+    async def test_small_min_loop_distance_detects_short_repeats(
+        self, min_distance: int
+    ) -> None:
+        """Small min_loop_distance values detect repeats at the exact configured length."""
+        plugin = OpenAIGuardRail({"break_loops": True, "min_loop_distance": min_distance})
+        block = "abcde"[:min_distance]
+        upstream = _Upstream(
+            sse_content("1", block) + sse_content("1", block) + sse_done(),
+            _recovered_reply(),
+        )
+        await _drive_result(plugin, upstream.forward, _make_client_response())
+        assert upstream.calls == 2
+
+    async def test_first_char_loop_trigger_rolls_back_cleanly_on_retry(self) -> None:
+        """A single-character chunk that closes a loop rolls back cleanly before retry continues."""
+        plugin = OpenAIGuardRail(
+            {"break_loops": True, "min_loop_distance": _FIRST_CHAR_TRIGGER_BLOCK_SIZE}
+        )
+        upstream = _Upstream(
+            sse_content("1", "a" * _FIRST_CHAR_TRIGGER_BLOCK_SIZE)
+            + sse_content("1", "a" * (_FIRST_CHAR_TRIGGER_BLOCK_SIZE - 1))
+            + sse_content("1", "a")
+            + sse_done(),
+            sse_content("2", "b") + sse_finish_reason("2", "stop") + sse_done(),
+        )
+        written = await _drive(plugin, upstream.forward, _make_client_response())
+        assert upstream.calls == 2
+        assert extract_sse_field(written) == "a" * _FIRST_CHAR_TRIGGER_PREFIX_COUNT + "b"
